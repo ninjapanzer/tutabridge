@@ -25,9 +25,21 @@ async fn main() -> anyhow::Result<()> {
             };
             return run_backup(output).await;
         }
+        Some("password") => {
+            let pw = config::load_config()
+                .map_err(|e| anyhow::anyhow!("{e}"))?
+                .and_then(|cfg| cfg.bridge_password);
+            let Some(pw) = pw else {
+                eprintln!("No bridge password yet — run the bridge once to generate one.");
+                std::process::exit(1);
+            };
+            println!("{pw}");
+            return Ok(());
+        }
         Some("--help") | Some("-h") | Some("help") => {
             println!("tutabridge                 run the IMAP/SMTP bridge (default)");
             println!("tutabridge backup <dir>    export every mail to <dir> as .eml files");
+            println!("tutabridge password        print the local bridge password (mail client setup)");
             return Ok(());
         }
         _ => {}
@@ -54,6 +66,7 @@ async fn main() -> anyhow::Result<()> {
         }
     };
 
+    let bridge_password_is_new = cfg.bridge_password.is_none();
     let bridge_password = config::ensure_bridge_password(&mut cfg)
         .map_err(|e| anyhow::anyhow!("Bridge password setup failed: {e}"))?;
     info!("TutaBridge starting...");
@@ -223,8 +236,14 @@ async fn main() -> anyhow::Result<()> {
     info!("  IMAP server: 127.0.0.1:{} (SSL/TLS)", cfg.imap_port);
     info!("  SMTP server: 127.0.0.1:{} (SSL/TLS)", cfg.smtp_port);
     info!("  Username: {}", cfg.email);
-    info!("  Password: {}", bridge_password);
+    info!("  Password: ******** (run 'tutabridge password' to view)");
     info!("  Accept the self-signed certificate when prompted");
+    if bridge_password_is_new {
+        use std::io::IsTerminal;
+        if std::io::stdout().is_terminal() {
+            println!("Generated bridge password: {bridge_password}");
+        }
+    }
 
     tokio::select! {
         _ = tokio::signal::ctrl_c() => {
