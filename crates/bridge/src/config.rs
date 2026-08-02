@@ -97,6 +97,9 @@ pub fn store_mails_dir() -> PathBuf {
 pub fn load_config() -> Result<Option<Config>, Box<dyn std::error::Error>> {
     let path = config_path();
     if path.exists() {
+        // The file holds the bridge password; heal installs whose config was
+        // written before files were created owner-only.
+        crate::fs_private::tighten(&path);
         let content = std::fs::read_to_string(&path)?;
         Ok(Some(toml::from_str(&content)?))
     } else {
@@ -106,9 +109,9 @@ pub fn load_config() -> Result<Option<Config>, Box<dyn std::error::Error>> {
 
 pub fn save_config(cfg: &Config) -> Result<(), Box<dyn std::error::Error>> {
     let path = config_path();
-    std::fs::create_dir_all(path.parent().unwrap())?;
+    crate::fs_private::create_dir_all_private(path.parent().unwrap())?;
     let content = toml::to_string_pretty(cfg)?;
-    std::fs::write(&path, &content)?;
+    crate::fs_private::write_private(&path, &content)?;
     Ok(())
 }
 
