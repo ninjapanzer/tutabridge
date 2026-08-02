@@ -25,6 +25,8 @@ pub fn load_or_create_tls_acceptor() -> Result<TlsAcceptor, Box<dyn std::error::
 
     let (cert_pem, key_pem) = if cert_file.exists() && key_file.exists() {
         log::info!("Loading TLS certificate from {}", cert_file.display());
+        // Heal installs whose key was written before it was created owner-only.
+        crate::fs_private::tighten(&key_file);
         (
             std::fs::read_to_string(&cert_file)?,
             std::fs::read_to_string(&key_file)?,
@@ -32,9 +34,9 @@ pub fn load_or_create_tls_acceptor() -> Result<TlsAcceptor, Box<dyn std::error::
     } else {
         log::info!("Generating self-signed TLS certificate...");
         let (cert, key) = generate_self_signed()?;
-        std::fs::create_dir_all(cert_dir())?;
+        crate::fs_private::create_dir_all_private(cert_dir())?;
         std::fs::write(&cert_file, &cert)?;
-        std::fs::write(&key_file, &key)?;
+        crate::fs_private::write_private(&key_file, &key)?;
         log::info!("Certificate saved to {}", cert_file.display());
         (cert, key)
     };

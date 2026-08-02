@@ -82,7 +82,8 @@ pub async fn export_eml(
     output: &Path,
     mut progress: impl FnMut(&BackupProgress),
 ) -> Result<BackupStats, String> {
-    std::fs::create_dir_all(output)
+    // Backups are plaintext mail — keep the whole tree owner-only.
+    crate::fs_private::create_dir_all_private(output)
         .map_err(|e| format!("Cannot create {}: {e}", output.display()))?;
 
     let folders = backend.list_folders().await?;
@@ -90,7 +91,7 @@ pub async fn export_eml(
 
     for folder in &folders {
         let folder_dir = folder_output_dir(output, &folder.imap_path);
-        std::fs::create_dir_all(&folder_dir)
+        crate::fs_private::create_dir_all_private(&folder_dir)
             .map_err(|e| format!("Cannot create {}: {e}", folder_dir.display()))?;
         stats.folders += 1;
 
@@ -155,7 +156,8 @@ pub async fn export_eml(
                 }
             };
 
-            match tokio::task::block_in_place(|| std::fs::write(&path, eml.as_bytes())) {
+            match tokio::task::block_in_place(|| crate::fs_private::write_private(&path, eml.as_bytes()))
+            {
                 Ok(()) => {
                     stats.mails_written += 1;
                     stats.bytes += eml.len() as u64;

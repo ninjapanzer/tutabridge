@@ -3,6 +3,7 @@ pub mod body_cache;
 pub mod bridge;
 pub mod config;
 pub mod event_handler;
+mod fs_private;
 mod governed_client;
 pub mod imap;
 pub mod mail;
