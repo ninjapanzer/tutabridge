@@ -156,8 +156,9 @@ pub async fn export_eml(
                 }
             };
 
-            match tokio::task::block_in_place(|| crate::fs_private::write_private(&path, eml.as_bytes()))
-            {
+            match tokio::task::block_in_place(|| {
+                crate::fs_private::write_private(&path, eml.as_bytes())
+            }) {
                 Ok(()) => {
                     stats.mails_written += 1;
                     stats.bytes += eml.len() as u64;
