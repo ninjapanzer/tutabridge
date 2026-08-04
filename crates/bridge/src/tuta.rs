@@ -11,9 +11,9 @@ use tutasdk::blobs::blob_facade::FileData;
 use tutasdk::crypto_entity_client::CryptoEntityClient;
 use tutasdk::entities::generated::sys::BlobReferenceTokenWrapper;
 use tutasdk::entities::generated::tutanota::{
-    AttachmentKeyData, DraftAttachment, DraftCreateData, DraftData, DraftRecipient, Mail, MailBox,
-    MailDetails, MailDetailsBlob, MailSetEntry, NewDraftAttachment, SendDraftData,
-    SendDraftParameters, TutanotaFile,
+    AttachmentKeyData, ConversationEntry, DraftAttachment, DraftCreateData, DraftData,
+    DraftRecipient, Mail, MailBox, MailDetails, MailDetailsBlob, MailSetEntry, NewDraftAttachment,
+    SendDraftData, SendDraftParameters, TutanotaFile,
 };
 use tutasdk::folder_system::{FolderSystem, MailSetKind};
 use tutasdk::services::generated::tutanota::{DraftService, SendDraftService};
@@ -150,6 +150,30 @@ const SELF_SEND_CACHE_TTL: std::time::Duration = std::time::Duration::from_secs(
 /// oldest entry is evicted regardless of TTL.
 const SELF_SEND_CACHE_MAX_ENTRIES: usize = 50;
 
+/// Tuta `ConversationType` values (see the web client's `ConversationType`
+/// enum): NEW=0, REPLY=1, FORWARD=2, UNKNOWN=3. UNKNOWN is unusable here:
+/// the send 500s for UNKNOWN with a `previousMessageId` the server can't
+/// resolve (established by probing), so unresolvable references send as
+/// NEW instead.
+const CONVERSATION_TYPE_NEW: i64 = 0;
+const CONVERSATION_TYPE_REPLY: i64 = 1;
+
+/// How long a submitted-Message-ID → server-assigned-id mapping is kept.
+/// git send-email submits a whole series within seconds; an hour covers
+/// pauses and manual resends without unbounded growth.
+const SENT_ID_CACHE_TTL: std::time::Duration = std::time::Duration::from_secs(60 * 60);
+
+/// Soft cap on remembered sent ids — a 200-patch series fits, a
+/// long-running bridge stays bounded.
+const SENT_ID_CACHE_MAX_ENTRIES: usize = 200;
+
+/// One remembered send: when it happened and the Message-ID the server
+/// assigned to the delivered mail (bare, no angle brackets).
+struct SentIdEntry {
+    stored_at: std::time::Instant,
+    tuta_message_id: String,
+}
+
 pub struct TutaSession {
     pub logged_in: Arc<LoggedInSdk>,
     pub email: String,
@@ -164,6 +188,12 @@ pub struct TutaSession {
     /// short-circuit `load_attachments` for self-sends and serve the
     /// cached bytes directly.
     self_send_cache: Arc<tokio::sync::Mutex<HashMap<String, SelfSendCacheEntry>>>,
+    /// Submitted `Message-ID` → server-assigned Message-ID, for mails sent
+    /// through this bridge. The server replaces the submitted id on
+    /// delivery, so a later submission whose `In-Reply-To` references an id
+    /// we sent (patch 2..N of a git send-email series) must be threaded
+    /// against the id the server actually delivered.
+    sent_id_cache: Arc<tokio::sync::Mutex<HashMap<String, SentIdEntry>>>,
 }
 
 impl TutaSession {
@@ -588,10 +618,18 @@ impl TutaSession {
 
         let draft_data = build_draft_data(msg, &self.email, added_attachments);
 
+        // Thread replies: a submission carrying In-Reply-To (git send-email
+        // series, MUA replies) gets its reference resolved to an id the
+        // server can act on. Unresolvable → (None, NEW), today's behavior.
+        let (previous_message_id, conversation_type) = match &msg.in_reply_to {
+            Some(irt) => self.resolve_previous_message(irt).await,
+            None => (None, CONVERSATION_TYPE_NEW),
+        };
+
         let create_data = DraftCreateData {
             _format: 0,
-            previousMessageId: None,
-            conversationType: 0,
+            previousMessageId: previous_message_id,
+            conversationType: conversation_type,
             ownerEncSessionKey: owner_enc_session_key,
             ownerKeyVersion: owner_key_version,
             draftData: draft_data,
@@ -632,6 +670,7 @@ impl TutaSession {
             draft_return.draft,
             parameters_id,
             attachment_key_data,
+            msg.is_plaintext,
         );
 
         let send_return = executor
@@ -639,6 +678,13 @@ impl TutaSession {
             .await?;
 
         log::info!("Mail sent, message_id: {}", send_return.messageId);
+
+        // Remember submitted-id → delivered-id so the next patch in a
+        // series can thread against what the server actually sent.
+        if let Some(submitted_id) = &msg.message_id {
+            self.remember_sent_message_id(submitted_id, &send_return.messageId)
+                .await;
+        }
         Ok(())
     }
 
@@ -674,6 +720,91 @@ impl TutaSession {
                 attachments,
             },
         );
+    }
+
+    /// Remember which Message-ID the server assigned to a mail we just
+    /// sent, keyed by the id the submitter used. Same soft-eviction shape
+    /// as the self-send cache.
+    async fn remember_sent_message_id(&self, submitted_id: &str, tuta_id: &str) {
+        let mut cache = self.sent_id_cache.lock().await;
+        if cache.len() >= SENT_ID_CACHE_MAX_ENTRIES && !cache.contains_key(submitted_id) {
+            if let Some(oldest_key) = cache
+                .iter()
+                .min_by_key(|(_, v)| v.stored_at)
+                .map(|(k, _)| k.clone())
+            {
+                cache.remove(&oldest_key);
+            }
+        }
+        cache.insert(
+            submitted_id.to_string(),
+            SentIdEntry {
+                stored_at: std::time::Instant::now(),
+                tuta_message_id: tuta_id.to_string(),
+            },
+        );
+    }
+
+    async fn lookup_sent_message_id(&self, submitted_id: &str) -> Option<String> {
+        let cache = self.sent_id_cache.lock().await;
+        cache
+            .get(submitted_id)
+            .filter(|e| e.stored_at.elapsed() <= SENT_ID_CACHE_TTL)
+            .map(|e| e.tuta_message_id.clone())
+    }
+
+    /// The server-known Message-ID of a mail the bridge served over IMAP,
+    /// given the `<list.elem@tutabridge.local>` id it minted for it: load
+    /// the Mail, then its ConversationEntry — `messageId` there is what
+    /// the official client passes as `previousMessageId` when replying.
+    async fn load_conversation_entry_message_id(
+        &self,
+        list_id: &str,
+        element_id: &str,
+    ) -> Result<Option<String>, ApiCallError> {
+        let Some(mail) = self.load_mail_by_id(list_id, element_id).await? else {
+            return Ok(None);
+        };
+        match self
+            .crypto_client()
+            .load::<ConversationEntry, _>(&mail.conversationEntry)
+            .await
+        {
+            Ok(ce) => Ok(Some(ce.messageId)),
+            Err(ApiCallError::ServerResponseError {
+                source: tutasdk::rest_error::HttpError::NotFoundError,
+            }) => Ok(None),
+            Err(e) => Err(e),
+        }
+    }
+
+    /// Resolve a submission's `In-Reply-To` into `(previousMessageId,
+    /// conversationType)` for draft creation. Every failure degrades to
+    /// `(None, NEW)` — the pre-threading behavior — so a send can never
+    /// fail because of this.
+    async fn resolve_previous_message(&self, in_reply_to: &str) -> (Option<String>, i64) {
+        // A mail this bridge sent: the submitter's id was replaced on
+        // delivery, thread against the server-assigned one.
+        if let Some(tuta_id) = self.lookup_sent_message_id(in_reply_to).await {
+            return (Some(tuta_id), CONVERSATION_TYPE_REPLY);
+        }
+        // A mail this bridge served over IMAP under its own minted id:
+        // resolve the real id via the conversation entry.
+        if let Some((list_id, element_id)) = parse_bridge_local_id(in_reply_to) {
+            return match self
+                .load_conversation_entry_message_id(&list_id, &element_id)
+                .await
+            {
+                Ok(Some(mid)) => (Some(mid), CONVERSATION_TYPE_REPLY),
+                // Resolution failed — don't leak the synthetic local id
+                // upstream, it references nothing outside this bridge.
+                _ => (None, CONVERSATION_TYPE_NEW),
+            };
+        }
+        // A foreign id the server may not know, and no conversation type
+        // can safely carry it (see `CONVERSATION_TYPE_NEW` above), so keep
+        // today's unthreaded behavior rather than risk the send.
+        (None, CONVERSATION_TYPE_NEW)
     }
 
     /// Look up cached attachments for an incoming Mail whose own copy of
@@ -752,6 +883,19 @@ fn is_self_recipient(msg: &ParsedMessage, own_email: &str) -> bool {
         .chain(msg.cc.iter())
         .chain(msg.bcc.iter())
         .any(|(_, addr)| addr.to_ascii_lowercase() == me)
+}
+
+/// Split a Message-ID the bridge minted for IMAP —
+/// `<list>.<element>@tutabridge.local` (see `mail_to_rfc2822`) — back into
+/// its id tuple. Returns `None` for any other id. Tuta generated ids never
+/// contain `.`, so the first dot is the separator.
+fn parse_bridge_local_id(id: &str) -> Option<(String, String)> {
+    let rest = id.strip_suffix("@tutabridge.local")?;
+    let (list, elem) = rest.split_once('.')?;
+    if list.is_empty() || elem.is_empty() {
+        return None;
+    }
+    Some((list.to_string(), elem.to_string()))
 }
 
 /// Stable, lowercase key for the self-send cache. The Sent and Inbox
@@ -989,6 +1133,7 @@ pub async fn login_with_2fa(
                     email: cfg.email.clone(),
                     access_token,
                     self_send_cache: Arc::new(tokio::sync::Mutex::new(HashMap::new())),
+                    sent_id_cache: Arc::new(tokio::sync::Mutex::new(HashMap::new())),
                 });
             }
             Err(e) => {
@@ -1069,6 +1214,7 @@ pub async fn login_with_2fa(
         email: cfg.email.clone(),
         access_token: credentials.access_token,
         self_send_cache: Arc::new(tokio::sync::Mutex::new(HashMap::new())),
+        sent_id_cache: Arc::new(tokio::sync::Mutex::new(HashMap::new())),
     })
 }
 
@@ -1172,15 +1318,22 @@ fn build_draft_recipients(recipients: &[(String, String)]) -> Vec<DraftRecipient
 /// Mirrors the web client: the body goes into both `bodyText` and
 /// `compressedBodyText`, and empty sender/recipient names fall back to the
 /// address (an empty name makes `SendDraftService` fail).
+///
+/// A plaintext submission is stored as the reversible encoding of its raw
+/// SMTP bytes, never the `<pre>` rendering — see [`plaintext_to_tuta_html`].
 fn build_draft_data(
     msg: &ParsedMessage,
     sender_email: &str,
     added_attachments: Vec<DraftAttachment>,
 ) -> DraftData {
+    let body = match (msg.is_plaintext, &msg.body_text) {
+        (true, Some(text)) => plaintext_to_tuta_html(text),
+        _ => msg.body_html.clone(),
+    };
     DraftData {
         _id: None,
         subject: msg.subject.clone(),
-        bodyText: msg.body_html.clone(),
+        bodyText: body.clone(),
         senderMailAddress: sender_email.to_string(),
         senderName: if msg.from_name.is_empty() {
             sender_email.to_string()
@@ -1189,7 +1342,7 @@ fn build_draft_data(
         },
         confidential: false,
         method: 0,
-        compressedBodyText: Some(msg.body_html.clone()),
+        compressedBodyText: Some(body),
         toRecipients: build_draft_recipients(&msg.to),
         ccRecipients: build_draft_recipients(&msg.cc),
         bccRecipients: build_draft_recipients(&msg.bcc),
@@ -1198,6 +1351,32 @@ fn build_draft_data(
         replyTos: vec![],
         _errors: Default::default(),
     }
+}
+
+/// Encode a raw text/plain body for Tuta draft storage: escape `&` `<` `>`,
+/// then one `<br>` per newline (any convention). Nothing else — no `<pre>`,
+/// no wrapping.
+///
+/// Why this exact shape (the server is closed source; established by
+/// loopback probes against it):
+/// - Tuta stores `bodyText` verbatim, so what we write is what every later
+///   consumer reads.
+/// - With `SendDraftData.plaintext` set, the server derives the outbound
+///   text/plain by a lossy HTML→text conversion: it strips tags, decodes
+///   entities and maps `<br>`/block structure to newlines (it must — that
+///   is how plaintext-only accounts' editor HTML goes out readable). So
+///   `<pre>`-wrapped content loses all line structure, and fully-raw text
+///   loses `</dev/null`-style spans to the tag stripper. Escape+`<br>` is
+///   the unique fixed point: strip+decode is exactly its inverse.
+/// - The bridge's own IMAP rendering (`html_to_text`) inverts it the same
+///   way, so the Sent-folder text/plain part reproduces the submission.
+pub(crate) fn plaintext_to_tuta_html(text: &str) -> String {
+    text.replace('&', "&amp;")
+        .replace('<', "&lt;")
+        .replace('>', "&gt;")
+        .replace("\r\n", "<br>")
+        .replace('\n', "<br>")
+        .replace('\r', "<br>")
 }
 
 /// Recognise the SDK error shape that means "the server returned the entity
@@ -1229,15 +1408,17 @@ fn random_custom_id(randomizer: &RandomizerFacade) -> CustomId {
 /// Build the `SendDraftData` for sending a previously created draft.
 ///
 /// The session data is mirrored into the nested `parameters` aggregate (with a
-/// generated `_id`), which the current server model reads; `plaintext` is
-/// `false` (it reflects the account's plaintext-only setting, not whether the
-/// mail is encrypted). Recipient key arrays stay empty for a non-confidential
-/// send.
+/// generated `_id`), which the current server model reads. `plaintext` asks
+/// the server to generate the outbound external mail as text/plain instead of
+/// HTML — set per-send from the submission's MIME type (the official client
+/// feeds it the account-wide `sendPlaintextOnly` setting instead). Recipient
+/// key arrays stay empty for a non-confidential send.
 fn build_send_draft_data(
     session_key_bytes: Vec<u8>,
     draft_id: IdTupleGenerated,
     parameters_id: CustomId,
     attachment_key_data: Vec<AttachmentKeyData>,
+    plaintext: bool,
 ) -> SendDraftData {
     SendDraftData {
         _format: 0,
@@ -1245,7 +1426,7 @@ fn build_send_draft_data(
         mailSessionKey: Some(session_key_bytes.clone()),
         bucketEncMailSessionKey: None,
         senderNameUnencrypted: None,
-        plaintext: false,
+        plaintext,
         calendarMethod: false,
         sessionEncEncryptionAuthStatus: None,
         sendAt: None,
@@ -1261,7 +1442,7 @@ fn build_send_draft_data(
             mailSessionKey: Some(session_key_bytes),
             bucketEncMailSessionKey: None,
             senderNameUnencrypted: None,
-            plaintext: false,
+            plaintext,
             calendarMethod: false,
             sessionEncEncryptionAuthStatus: None,
             mail: draft_id,
@@ -1286,6 +1467,10 @@ mod self_send_cache_tests {
             bcc: vec![],
             subject: subject.to_string(),
             body_html: "<p>body</p>".to_string(),
+            body_text: None,
+            message_id: None,
+            in_reply_to: None,
+            is_plaintext: false,
             attachments: vec![],
         }
     }
@@ -1397,6 +1582,10 @@ mod send_tests {
             bcc: vec![],
             subject: "Hi".to_string(),
             body_html: "<p>hello</p>".to_string(),
+            body_text: None,
+            message_id: None,
+            in_reply_to: None,
+            is_plaintext: false,
             attachments: vec![],
         }
     }
@@ -1408,6 +1597,41 @@ mod send_tests {
         assert_eq!(d.compressedBodyText.as_deref(), Some("<p>hello</p>"));
         assert!(!d.confidential);
         assert_eq!(d.method, 0);
+    }
+
+    #[test]
+    fn draft_data_encodes_plaintext_submissions_reversibly() {
+        // Neither the <pre> rendering nor the raw bytes may reach the
+        // server: the outbound converter collapses <pre> newlines and eats
+        // raw `</dev/null ... <tag>` spans as markup. Only escape+<br>
+        // survives strip+decode.
+        let mut msg = sample_msg();
+        msg.is_plaintext = true;
+        msg.body_text = Some("read </dev/null\r\na && b\n".to_string());
+        msg.body_html = "<pre>ignored</pre>".to_string();
+        let d = build_draft_data(&msg, "me@tuta.io", vec![]);
+        assert_eq!(d.bodyText, "read &lt;/dev/null<br>a &amp;&amp; b<br>");
+        assert_eq!(d.compressedBodyText.as_deref(), Some(d.bodyText.as_str()));
+    }
+
+    #[test]
+    fn bridge_local_id_parses_and_rejects() {
+        assert_eq!(
+            parse_bridge_local_id("Lst-1.Elem_2@tutabridge.local"),
+            Some(("Lst-1".to_string(), "Elem_2".to_string()))
+        );
+        assert_eq!(parse_bridge_local_id("20260802.1234@scarrone.co"), None);
+        assert_eq!(parse_bridge_local_id("no-dot@tutabridge.local"), None);
+        assert_eq!(parse_bridge_local_id(".x@tutabridge.local"), None);
+    }
+
+    #[test]
+    fn plaintext_encoding_round_trips_through_html_to_text() {
+        // The bridge's own receive-side conversion must invert the storage
+        // encoding exactly (modulo CRLF→LF, which the encoding folds).
+        let patch = "diff --git a/x.c b/x.c\n-if (a < b && c > d)\n+while (p != NULL)\n\t\"quoted\"  two  spaces\n";
+        let stored = plaintext_to_tuta_html(patch);
+        assert_eq!(crate::mail::rfc2822::html_to_text(&stored), patch);
     }
 
     #[test]
@@ -1445,7 +1669,7 @@ mod send_tests {
         );
         let pid = CustomId("aggId".to_string());
         let sk = vec![1u8, 2, 3, 4];
-        let sd = build_send_draft_data(sk.clone(), draft_id.clone(), pid.clone(), vec![]);
+        let sd = build_send_draft_data(sk.clone(), draft_id.clone(), pid.clone(), vec![], false);
 
         // top-level
         assert!(!sd.plaintext);
@@ -1462,5 +1686,17 @@ mod send_tests {
         assert!(!p.plaintext);
         assert_eq!(p.mailSessionKey.as_deref(), Some(sk.as_slice()));
         assert_eq!(p.mail, draft_id);
+    }
+
+    #[test]
+    fn send_draft_data_plaintext_flag_set_in_both_places() {
+        let draft_id = IdTupleGenerated::new(
+            tutasdk::GeneratedId("list".to_string()),
+            tutasdk::GeneratedId("elem".to_string()),
+        );
+        let pid = CustomId("aggId".to_string());
+        let sd = build_send_draft_data(vec![1u8], draft_id, pid, vec![], true);
+        assert!(sd.plaintext);
+        assert!(sd.parameters.expect("parameters must be set").plaintext);
     }
 }

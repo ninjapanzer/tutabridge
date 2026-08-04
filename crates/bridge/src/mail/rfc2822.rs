@@ -59,13 +59,11 @@ pub fn mail_to_rfc2822(
     let body_text = details
         .and_then(|d| d.body.compressedText.as_deref().or(d.body.text.as_deref()))
         .unwrap_or("<p>(No body available)</p>");
+    let body_plain = html_to_text(body_text);
+    let alt_boundary = build_alt_boundary(mail);
 
     if attachments.is_empty() {
-        msg.push_str("Content-Type: text/html; charset=UTF-8\r\n");
-        msg.push_str("Content-Transfer-Encoding: base64\r\n");
-        msg.push_str("\r\n");
-        msg.push_str(&base64_encode_body(body_text.as_bytes()));
-        msg.push_str("\r\n");
+        push_alternative_body(&mut msg, &alt_boundary, &body_plain, body_text);
     } else {
         // The boundary is derived from the mail's element id so the same
         // mail always produces the same MIME boundary — keeps `.eml.enc`
@@ -79,10 +77,7 @@ pub fn mail_to_rfc2822(
         msg.push_str("This is a multi-part message in MIME format.\r\n");
 
         msg.push_str(&format!("--{}\r\n", boundary));
-        msg.push_str("Content-Type: text/html; charset=UTF-8\r\n");
-        msg.push_str("Content-Transfer-Encoding: base64\r\n\r\n");
-        msg.push_str(&base64_encode_body(body_text.as_bytes()));
-        msg.push_str("\r\n");
+        push_alternative_body(&mut msg, &alt_boundary, &body_plain, body_text);
 
         for (file, data) in attachments {
             msg.push_str(&format!("--{}\r\n", boundary));
@@ -125,6 +120,125 @@ fn build_boundary(mail: &Mail) -> String {
     } else {
         "=_TutaBridge_unknown".to_owned()
     }
+}
+
+/// Boundary for the inner `multipart/alternative` part. Same stability rules
+/// as [`build_boundary`]; the `Alt` sits before the ids so neither boundary
+/// is a prefix of the other (the lenient `split_mime_parts` matches on
+/// `starts_with`, so a shared prefix would split the outer part on inner
+/// delimiters).
+fn build_alt_boundary(mail: &Mail) -> String {
+    if let Some(ref id) = mail._id {
+        format!("=_TutaBridgeAlt_{}_{}", id.list_id, id.element_id)
+    } else {
+        "=_TutaBridgeAlt_unknown".to_owned()
+    }
+}
+
+/// Write the `multipart/alternative` body — text/plain first, text/html
+/// second (RFC 2046 §5.1.4: order of increasing preference), both base64.
+fn push_alternative_body(msg: &mut String, boundary: &str, plain: &str, html: &str) {
+    msg.push_str(&format!(
+        "Content-Type: multipart/alternative; boundary=\"{}\"\r\n",
+        boundary
+    ));
+    msg.push_str("\r\n");
+    msg.push_str(&format!("--{}\r\n", boundary));
+    msg.push_str("Content-Type: text/plain; charset=UTF-8\r\n");
+    msg.push_str("Content-Transfer-Encoding: base64\r\n\r\n");
+    msg.push_str(&base64_encode_body(plain.as_bytes()));
+    msg.push_str("\r\n");
+    msg.push_str(&format!("--{}\r\n", boundary));
+    msg.push_str("Content-Type: text/html; charset=UTF-8\r\n");
+    msg.push_str("Content-Transfer-Encoding: base64\r\n\r\n");
+    msg.push_str(&base64_encode_body(html.as_bytes()));
+    msg.push_str(&format!("\r\n--{}--\r\n", boundary));
+}
+
+/// Convert a Tuta HTML body to text for the text/plain alternative part.
+///
+/// Must invert the storage encoding exactly, or `git am` breaks on received
+/// patches. Two shapes recover byte-for-byte:
+/// - escape+`<br>`, what `plaintext_to_tuta_html` writes for plaintext sends
+///   — handled by the general path below.
+/// - exactly one flat `<pre>` block of entity-escaped text, how bridge
+///   versions before the plaintext fix stored them — the fast path.
+///
+/// Anything else gets a whitespace-PRESERVING strip: `<br>` and closing
+/// block tags become newlines, script/style contents are dropped, entities
+/// are decoded. (`strip_html` is unsuitable here — it collapses whitespace
+/// for search indexing.)
+pub(crate) fn html_to_text(html: &str) -> String {
+    let trimmed = html.trim();
+    let lower = trimmed.to_ascii_lowercase();
+    if let Some(inner) = lower
+        .strip_prefix("<pre>")
+        .and_then(|r| r.strip_suffix("</pre>"))
+    {
+        // No raw '<' inside means this really is a single flat <pre> block —
+        // escaped content never contains one. Tags are ASCII, so the byte
+        // offsets found in `lower` slice `trimmed` safely.
+        if !inner.contains('<') {
+            return decode_entities(&trimmed[5..trimmed.len() - 6]);
+        }
+    }
+
+    let mut out = String::with_capacity(trimmed.len());
+    let mut chars = trimmed.chars();
+    while let Some(c) = chars.next() {
+        if c != '<' {
+            out.push(c);
+            continue;
+        }
+        let mut tag = String::new();
+        for t in chars.by_ref() {
+            if t == '>' {
+                break;
+            }
+            tag.push(t.to_ascii_lowercase());
+        }
+        let closing = tag.starts_with('/');
+        let name = tag
+            .trim_start_matches('/')
+            .split(|c: char| c.is_whitespace() || c == '/')
+            .next()
+            .unwrap_or("");
+        if !closing && matches!(name, "script" | "style") {
+            // Swallow everything until the matching closing tag.
+            let close = format!("</{name}");
+            let mut window = String::new();
+            for t in chars.by_ref() {
+                window.push(t.to_ascii_lowercase());
+                if window.ends_with(&close) {
+                    for t2 in chars.by_ref() {
+                        if t2 == '>' {
+                            break;
+                        }
+                    }
+                    break;
+                }
+            }
+        } else if name == "br"
+            || (closing
+                && matches!(
+                    name,
+                    "p" | "div"
+                        | "tr"
+                        | "li"
+                        | "pre"
+                        | "blockquote"
+                        | "h1"
+                        | "h2"
+                        | "h3"
+                        | "h4"
+                        | "h5"
+                        | "h6"
+                ))
+        {
+            out.push('\n');
+        }
+    }
+    decode_entities(&out)
 }
 
 pub(crate) fn format_address(addr: &MailAddress) -> String {
@@ -278,13 +392,16 @@ pub(crate) fn strip_html(html: &str) -> String {
 }
 
 fn decode_entities(s: &str) -> String {
+    // `&amp;` strictly last: decoding it earlier makes a literal `&lt;` in
+    // the source text (stored as `&amp;lt;`) collapse to `<` in a second
+    // pass — a real hazard for patches touching HTML/XML.
     s.replace("&nbsp;", " ")
-        .replace("&amp;", "&")
         .replace("&lt;", "<")
         .replace("&gt;", ">")
         .replace("&quot;", "\"")
         .replace("&#39;", "'")
         .replace("&apos;", "'")
+        .replace("&amp;", "&")
 }
 
 /// Extract the readable body text from one of our own RFC 2822 messages, for
@@ -669,9 +786,28 @@ mod tests {
         assert!(rfc.contains("From: sender@tuta.com\r\n"));
         assert!(rfc.contains("To: Bob <bob@example.com>, charlie@example.com\r\n"));
         assert!(rfc.contains("Cc: Dave <dave@example.com>\r\n"));
-        // Body should be base64 of "<p>Hello World</p>"
+        // multipart/alternative with text/plain BEFORE text/html
+        assert!(rfc.contains(
+            "Content-Type: multipart/alternative; boundary=\"=_TutaBridgeAlt_list2_elem2\"\r\n"
+        ));
+        let plain_pos = rfc.find("Content-Type: text/plain").unwrap();
+        let html_pos = rfc.find("Content-Type: text/html").unwrap();
+        assert!(plain_pos < html_pos);
+        // html part is base64 of the stored body, plain part of its conversion
         let body_b64 = base64::engine::general_purpose::STANDARD.encode(b"<p>Hello World</p>");
         assert!(rfc.contains(&body_b64));
+        let plain_b64 = base64::engine::general_purpose::STANDARD.encode(b"Hello World\n");
+        assert!(rfc.contains(&plain_b64));
+        assert!(rfc.ends_with("--=_TutaBridgeAlt_list2_elem2--\r\n"));
+
+        // BODYSTRUCTURE reflects the alternative tree
+        let bs = crate::mail::bodystructure::compute_bodystructure(&rfc);
+        assert!(bs.contains("\"ALTERNATIVE\""));
+        assert!(bs.contains("\"PLAIN\""));
+        assert!(bs.contains("\"HTML\""));
+
+        // and the search indexer still finds the readable text
+        assert_eq!(extract_body_text(&rfc), "Hello World");
     }
 
     #[test]
@@ -779,8 +915,16 @@ mod tests {
             "Content-Type: multipart/mixed; boundary=\"=_TutaBridge_list_att_elem_att\""
         ));
         assert!(rfc.contains("--=_TutaBridge_list_att_elem_att\r\n"));
-        // Body part: text/html base64
+        // Body part: nested multipart/alternative (plain + html), closed
+        // before the attachment part starts.
+        assert!(rfc.contains(
+            "Content-Type: multipart/alternative; boundary=\"=_TutaBridgeAlt_list_att_elem_att\""
+        ));
+        assert!(rfc.contains("Content-Type: text/plain; charset=UTF-8\r\n"));
         assert!(rfc.contains("Content-Type: text/html; charset=UTF-8\r\n"));
+        let alt_close = rfc.find("--=_TutaBridgeAlt_list_att_elem_att--").unwrap();
+        let att_part = rfc.find("Content-Type: application/pdf").unwrap();
+        assert!(alt_close < att_part);
         let body_b64 = base64::engine::general_purpose::STANDARD.encode(b"<p>The body</p>");
         assert!(rfc.contains(&body_b64));
         // Attachment part
@@ -790,5 +934,53 @@ mod tests {
         assert!(rfc.contains(&pdf_b64));
         // Closing boundary
         assert!(rfc.ends_with("--=_TutaBridge_list_att_elem_att--\r\n"));
+
+        // BODYSTRUCTURE: mixed( alternative(plain, html), pdf )
+        let bs = crate::mail::bodystructure::compute_bodystructure(&rfc);
+        assert!(bs.contains("\"MIXED\""));
+        assert!(bs.contains("\"ALTERNATIVE\""));
+        assert!(bs.contains("\"PLAIN\""));
+        let alt_pos = bs.find("\"ALTERNATIVE\"").unwrap();
+        let pdf_pos = bs.find("\"PDF\"").unwrap();
+        assert!(alt_pos < pdf_pos);
+    }
+
+    #[test]
+    fn html_to_text_recovers_pre_wrapped_patch_exactly() {
+        // Bridge versions before the plaintext fix stored a text/plain
+        // submission as <pre>{html_escape(body)}</pre>. That mail is still
+        // in mailboxes, so the conversion back must stay byte-exact or
+        // `git am` corrupts patches containing < > &.
+        let patch = "Subject: [PATCH] fix\n\n\
+                     diff --git a/x.c b/x.c\n\
+                     -if (a < b && c > d)\n\
+                     +if (a <= b || c >= d)\n\
+                     \t\"quoted\"  double  spaces\n";
+        let escaped = patch
+            .replace('&', "&amp;")
+            .replace('<', "&lt;")
+            .replace('>', "&gt;")
+            .replace('"', "&quot;");
+        let stored = format!("<pre>{}</pre>", escaped);
+        assert_eq!(html_to_text(&stored), patch);
+    }
+
+    #[test]
+    fn html_to_text_pre_with_inner_tags_falls_through_to_strip() {
+        // Not a flat pre block — must take the lossy path, not exact recovery.
+        let html = "<pre>line one<br>line two</pre>";
+        assert_eq!(html_to_text(html), "line one\nline two\n");
+    }
+
+    #[test]
+    fn html_to_text_converts_breaks_and_blocks_to_newlines() {
+        let html = "<div>first</div><p>second<br>third</p><style>.x{}</style><script>bad()</script>tail &amp; end";
+        assert_eq!(html_to_text(html), "first\nsecond\nthird\ntail & end");
+    }
+
+    #[test]
+    fn html_to_text_preserves_whitespace() {
+        let html = "<pre>a  b\n\tc</pre>";
+        assert_eq!(html_to_text(html), "a  b\n\tc");
     }
 }

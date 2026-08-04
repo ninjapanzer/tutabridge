@@ -19,6 +19,26 @@ pub struct ParsedMessage {
     pub bcc: Vec<(String, String)>,
     pub subject: String,
     pub body_html: String,
+    /// The body exactly as submitted, when the submission carried only a
+    /// text/plain body (no HTML part) — e.g. git send-email patches.
+    /// Preserved verbatim: no escaping, no wrapping, original line endings.
+    /// Tuta's outbound text/plain generation is a lossy HTML→text
+    /// conversion, so anything the send path derives from `body_html`
+    /// cannot round-trip a patch — this is the only faithful source.
+    pub body_text: Option<String>,
+    /// True when the submission carried only a text/plain body. The send
+    /// path uses this to ask the server for text/plain outbound delivery
+    /// (and sends `body_text` as the draft body so there is no HTML for
+    /// the server's converter to mangle).
+    pub is_plaintext: bool,
+    /// The submission's own `Message-ID`, without angle brackets. The send
+    /// path records the server-assigned id against it so later submissions
+    /// referencing this one (a git send-email series) can be threaded.
+    pub message_id: Option<String>,
+    /// The message this submission replies to: `In-Reply-To`, falling back
+    /// to the last id in `References` (both set by git send-email; some
+    /// MUAs only set one). Without angle brackets.
+    pub in_reply_to: Option<String>,
     pub attachments: Vec<Attachment>,
 }
 
@@ -43,22 +63,32 @@ pub fn parse_rfc2822(raw: &str) -> ParsedMessage {
         .map(|s| decode_header_value(&s))
         .unwrap_or_default();
 
+    let message_id = get_header(&headers, "message-id")
+        .as_deref()
+        .and_then(first_msg_id);
+    let in_reply_to = get_header(&headers, "in-reply-to")
+        .as_deref()
+        .and_then(first_msg_id)
+        .or_else(|| {
+            get_header(&headers, "references")
+                .as_deref()
+                .and_then(last_msg_id)
+        });
+
     let content_type = get_header(&headers, "content-type").unwrap_or_default();
     let content_transfer_encoding = get_header(&headers, "content-transfer-encoding")
         .unwrap_or_default()
         .to_lowercase();
 
-    let (body_html, attachments) = if content_type.to_lowercase().contains("multipart/") {
+    let ct_lower = content_type.to_lowercase();
+    let (body_html, attachments, body_text) = if ct_lower.contains("multipart/") {
         extract_multipart_body_and_attachments(&body_section, &content_type)
     } else {
-        (
-            decode_body(
-                &body_section,
-                &content_transfer_encoding,
-                &content_type.to_lowercase(),
-            ),
-            Vec::new(),
-        )
+        // An absent Content-Type defaults to text/plain (RFC 2045 §5.2).
+        let is_plaintext = ct_lower.is_empty() || ct_lower.contains("text/plain");
+        let decoded = decode_transfer(&body_section, &content_transfer_encoding);
+        let body_html = wrap_plain_as_html(&decoded, &ct_lower);
+        (body_html, Vec::new(), is_plaintext.then_some(decoded))
     };
 
     ParsedMessage {
@@ -69,8 +99,46 @@ pub fn parse_rfc2822(raw: &str) -> ParsedMessage {
         bcc,
         subject,
         body_html,
+        is_plaintext: body_text.is_some(),
+        body_text,
+        message_id,
+        in_reply_to,
         attachments,
     }
+}
+
+/// All RFC 5322 msg-ids in a header value, angle brackets stripped. A value
+/// with no `<...>` spans (some MUAs write bare ids) yields the trimmed value
+/// itself, if non-empty.
+fn msg_ids(raw: &str) -> Vec<String> {
+    let mut ids = Vec::new();
+    let mut rest = raw;
+    while let Some(open) = rest.find('<') {
+        let Some(close) = rest[open + 1..].find('>') else {
+            break;
+        };
+        let id = rest[open + 1..open + 1 + close].trim();
+        if !id.is_empty() {
+            ids.push(id.to_string());
+        }
+        rest = &rest[open + 1 + close + 1..];
+    }
+    if ids.is_empty() {
+        let bare = raw.trim();
+        if !bare.is_empty() {
+            ids.push(bare.to_string());
+        }
+    }
+    ids
+}
+
+fn first_msg_id(raw: &str) -> Option<String> {
+    msg_ids(raw).into_iter().next()
+}
+
+/// `References` lists oldest→newest, so the last id is the direct parent.
+fn last_msg_id(raw: &str) -> Option<String> {
+    msg_ids(raw).into_iter().next_back()
 }
 
 pub(super) fn split_headers_body(raw: &str) -> (String, String) {
@@ -264,13 +332,16 @@ pub(super) fn extract_boundary(content_type: &str) -> Option<String> {
 ///   * the user-facing HTML (or plain) body (first non-attachment text part);
 ///   * every part that looks like a file attachment (non-text, or a part
 ///     with `Content-Disposition: attachment` / a `name=` in its Content-Type).
+/// Returns `(body_html, attachments, body_text)` — `body_text` is the raw
+/// decoded text/plain body, present only when no HTML alternative existed
+/// anywhere (the submission was genuinely plaintext).
 fn extract_multipart_body_and_attachments(
     body: &str,
     content_type: &str,
-) -> (String, Vec<Attachment>) {
+) -> (String, Vec<Attachment>, Option<String>) {
     let boundary = match extract_boundary(content_type) {
         Some(b) => b,
-        None => return (body.to_string(), Vec::new()),
+        None => return (body.to_string(), Vec::new(), None),
     };
 
     let parts = split_mime_parts(body, &boundary);
@@ -293,9 +364,13 @@ fn extract_multipart_body_and_attachments(
             || (extract_param(&part_ct, "name").is_some() && !part_ct_lower.contains("text/"));
 
         if part_ct_lower.contains("multipart/") {
-            let (nested_body, nested_atts) =
+            let (nested_body, nested_atts, nested_text) =
                 extract_multipart_body_and_attachments(&part_body, &part_ct);
-            if html_part.is_none() && !nested_body.is_empty() {
+            if let Some(raw) = nested_text {
+                if text_part.is_none() {
+                    text_part = Some(raw);
+                }
+            } else if html_part.is_none() && !nested_body.is_empty() {
                 html_part = Some(nested_body);
             }
             attachments.extend(nested_atts);
@@ -328,15 +403,25 @@ fn extract_multipart_body_and_attachments(
                 data,
             });
         } else if part_ct_lower.contains("text/html") && html_part.is_none() {
-            html_part = Some(decode_body(&part_body, &part_cte, &part_ct_lower));
+            html_part = Some(decode_transfer(&part_body, &part_cte));
         } else if part_ct_lower.contains("text/plain") && html_part.is_none() && text_part.is_none()
         {
-            text_part = Some(decode_body(&part_body, &part_cte, &part_ct_lower));
+            // Raw — the `<pre>` HTML rendering is derived below only if no
+            // HTML alternative shows up in a later part.
+            text_part = Some(decode_transfer(&part_body, &part_cte));
         }
     }
 
-    let body = html_part.or(text_part).unwrap_or_else(|| body.to_string());
-    (body, attachments)
+    // Plaintext only when no HTML alternative existed anywhere: an unknown
+    // structure that falls back to the raw section is conservatively HTML.
+    match (html_part, text_part) {
+        (Some(html), _) => (html, attachments, None),
+        (None, Some(raw)) => {
+            let html = wrap_plain_as_html(&raw, "text/plain");
+            (html, attachments, Some(raw))
+        }
+        (None, None) => (body.to_string(), attachments, None),
+    }
 }
 
 /// Pull a `key=value` parameter out of a header value such as a Content-Type
@@ -401,8 +486,10 @@ pub(super) fn split_mime_parts(body: &str, boundary: &str) -> Vec<String> {
     parts
 }
 
-fn decode_body(body: &str, transfer_encoding: &str, content_type: &str) -> String {
-    let decoded = if transfer_encoding.contains("base64") {
+/// Undo the Content-Transfer-Encoding, nothing else — the result is the body
+/// exactly as the submitter wrote it.
+fn decode_transfer(body: &str, transfer_encoding: &str) -> String {
+    if transfer_encoding.contains("base64") {
         let clean: String = body.chars().filter(|c| !c.is_whitespace()).collect();
         base64::engine::general_purpose::STANDARD
             .decode(&clean)
@@ -415,12 +502,16 @@ fn decode_body(body: &str, transfer_encoding: &str, content_type: &str) -> Strin
         decode_quoted_printable(body)
     } else {
         body.to_string()
-    };
+    }
+}
 
+/// The HTML rendering of a decoded body: text/plain becomes an escaped
+/// `<pre>` block (for display in Tuta clients), anything else passes through.
+fn wrap_plain_as_html(decoded: &str, content_type: &str) -> String {
     if content_type.contains("text/plain") && !content_type.contains("text/html") {
-        format!("<pre>{}</pre>", html_escape(&decoded))
+        format!("<pre>{}</pre>", html_escape(decoded))
     } else {
-        decoded
+        decoded.to_string()
     }
 }
 
@@ -501,7 +592,7 @@ mod tests {
     fn base64_body_non_utf8_is_not_echoed_as_base64() {
         // "caf" + 0xE9 (Latin-1 'é'): valid base64, not valid UTF-8.
         let b64 = base64::engine::general_purpose::STANDARD.encode(b"caf\xe9");
-        let out = decode_body(&b64, "base64", "text/html");
+        let out = decode_transfer(&b64, "base64");
         assert!(!out.contains(&b64), "must not emit the raw base64 blob");
         assert!(
             out.starts_with("caf"),
@@ -546,6 +637,90 @@ mod tests {
         let raw = "From: a@b.com\r\nTo: b@c.com\r\nSubject: Test\r\nContent-Type: text/plain\r\n\r\nHello <world>";
         let msg = parse_rfc2822(raw);
         assert_eq!(msg.body_html, "<pre>Hello &lt;world&gt;</pre>");
+        assert!(msg.is_plaintext);
+    }
+
+    #[test]
+    fn message_id_and_in_reply_to_are_extracted_bare() {
+        let raw = "From: a@b.com\r\nMessage-ID: <20260802-1-paul@scarrone.co>\r\nIn-Reply-To: <20260802-0-paul@scarrone.co>\r\nReferences: <old@x> <20260802-0-paul@scarrone.co>\r\n\r\nbody";
+        let msg = parse_rfc2822(raw);
+        assert_eq!(
+            msg.message_id.as_deref(),
+            Some("20260802-1-paul@scarrone.co")
+        );
+        assert_eq!(
+            msg.in_reply_to.as_deref(),
+            Some("20260802-0-paul@scarrone.co")
+        );
+    }
+
+    #[test]
+    fn in_reply_to_falls_back_to_last_reference() {
+        // git send-email sets both; some MUAs only set References. The
+        // last id there is the direct parent.
+        let raw = "From: a@b.com\r\nReferences: <root@x>\r\n <parent@x>\r\n\r\nbody";
+        let msg = parse_rfc2822(raw);
+        assert_eq!(msg.in_reply_to.as_deref(), Some("parent@x"));
+    }
+
+    #[test]
+    fn bare_message_id_without_brackets_is_accepted() {
+        let raw = "From: a@b.com\r\nIn-Reply-To: bare-id@host\r\n\r\nbody";
+        let msg = parse_rfc2822(raw);
+        assert_eq!(msg.in_reply_to.as_deref(), Some("bare-id@host"));
+        assert!(msg.message_id.is_none());
+    }
+
+    #[test]
+    fn plaintext_body_is_preserved_verbatim() {
+        // The draft body sent to Tuta must be the SMTP bytes, untouched:
+        // shell metacharacters, blank lines, indentation, trailing spaces.
+        // The <pre> rendering exists alongside, not instead.
+        let body = "cmd >/dev/null 2>&1\r\nread </dev/null\r\na && b || c\r\nif [ $x -lt 5 ]; then echo \"<tag>\"; fi\r\n\r\n\tindented\r\n  two  spaces  \r\n";
+        let raw = format!(
+            "From: a@b.com\r\nTo: b@c.com\r\nSubject: probe\r\nContent-Type: text/plain\r\n\r\n{}",
+            body
+        );
+        let msg = parse_rfc2822(&raw);
+        assert!(msg.is_plaintext);
+        assert_eq!(msg.body_text.as_deref(), Some(body));
+        assert!(msg.body_html.starts_with("<pre>"));
+        assert!(msg.body_html.contains("&lt;tag&gt;"));
+    }
+
+    #[test]
+    fn plaintext_body_survives_quoted_printable() {
+        let raw = "From: a@b.com\r\nContent-Type: text/plain\r\nContent-Transfer-Encoding: quoted-printable\r\n\r\ndiff --git a/x b/x\r\n-a =3D b\r\n+a < b && c\r\n";
+        let msg = parse_rfc2822(raw);
+        assert_eq!(
+            msg.body_text.as_deref(),
+            Some("diff --git a/x b/x\r\n-a = b\r\n+a < b && c\r\n")
+        );
+    }
+
+    #[test]
+    fn multipart_plain_only_preserves_raw_body_text() {
+        let raw = "From: a@b.com\r\nContent-Type: multipart/mixed; boundary=\"bnd\"\r\n\r\n--bnd\r\nContent-Type: text/plain\r\n\r\nread </dev/null\na && b\n--bnd--";
+        let msg = parse_rfc2822(raw);
+        assert!(msg.is_plaintext);
+        assert_eq!(msg.body_text.as_deref(), Some("read </dev/null\na && b\n"));
+    }
+
+    #[test]
+    fn html_alternative_clears_body_text() {
+        let raw = "From: a@b.com\r\nContent-Type: multipart/alternative; boundary=\"b\"\r\n\r\n--b\r\nContent-Type: text/plain\r\n\r\nplain\r\n--b\r\nContent-Type: text/html\r\n\r\n<p>html</p>\r\n--b--";
+        let msg = parse_rfc2822(raw);
+        assert!(!msg.is_plaintext);
+        assert!(msg.body_text.is_none());
+    }
+
+    #[test]
+    fn is_plaintext_false_for_html_and_missing_default() {
+        let html = "From: a@b.com\r\nContent-Type: text/html\r\n\r\n<p>Hi</p>";
+        assert!(!parse_rfc2822(html).is_plaintext);
+        // No Content-Type defaults to text/plain (RFC 2045 §5.2).
+        let bare = "From: a@b.com\r\n\r\nHi";
+        assert!(parse_rfc2822(bare).is_plaintext);
     }
 
     #[test]
@@ -594,6 +769,7 @@ mod tests {
         let raw = "From: a@b.com\r\nTo: b@c.com\r\nSubject: Test\r\nContent-Type: multipart/alternative; boundary=\"abc123\"\r\n\r\n--abc123\r\nContent-Type: text/plain\r\n\r\nHello plain\r\n--abc123\r\nContent-Type: text/html\r\n\r\n<p>Hello HTML</p>\r\n--abc123--";
         let msg = parse_rfc2822(raw);
         assert!(msg.body_html.contains("Hello HTML"));
+        assert!(!msg.is_plaintext);
     }
 
     #[test]
@@ -608,6 +784,7 @@ mod tests {
         let raw = "From: a@b.com\r\nTo: b@c.com\r\nSubject: Test\r\nContent-Type: multipart/alternative; boundary=\"bnd\"\r\n\r\n--bnd\r\nContent-Type: text/plain\r\n\r\nJust plain\r\n--bnd--";
         let msg = parse_rfc2822(raw);
         assert!(msg.body_html.contains("Just plain"));
+        assert!(msg.is_plaintext);
     }
 
     #[test]
