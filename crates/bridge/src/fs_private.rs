@@ -12,10 +12,7 @@ use std::path::Path;
 /// `std::fs::write`, but the file is created with mode 0600 on Unix. A
 /// pre-existing file has its permissions tightened to 0600 as well, so
 /// installs that predate this hardening are healed on their next write.
-pub fn write_private(
-    path: impl AsRef<Path>,
-    contents: impl AsRef<[u8]>,
-) -> std::io::Result<()> {
+pub fn write_private(path: impl AsRef<Path>, contents: impl AsRef<[u8]>) -> std::io::Result<()> {
     #[cfg(unix)]
     {
         use std::fs::Permissions;
