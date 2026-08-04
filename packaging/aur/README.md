@@ -30,8 +30,7 @@ systemctl --user enable --now tutabridge     # run it in the background from now
 ```
 
 Connect your mail client to `127.0.0.1:1143` (IMAP) and `127.0.0.1:1025`
-(SMTP), using the bridge password printed in the logs
-(`journalctl --user -u tutabridge`).
+(SMTP), using the bridge password (`tutabridge password` prints it).
 
 ## Publishing to the AUR
 
