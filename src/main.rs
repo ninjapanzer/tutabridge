@@ -39,7 +39,9 @@ async fn main() -> anyhow::Result<()> {
         Some("--help") | Some("-h") | Some("help") => {
             println!("tutabridge                 run the IMAP/SMTP bridge (default)");
             println!("tutabridge backup <dir>    export every mail to <dir> as .eml files");
-            println!("tutabridge password        print the local bridge password (mail client setup)");
+            println!(
+                "tutabridge password        print the local bridge password (mail client setup)"
+            );
             return Ok(());
         }
         _ => {}
