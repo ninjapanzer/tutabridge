@@ -180,6 +180,7 @@ where
     let mut in_data = false;
     let mut data_too_large = false;
     let mut auth_step = AuthStep::None;
+    let mut authenticated = password_hash.is_none();
 
     loop {
         match read_line_capped(&mut reader, limits.max_line_bytes, &mut line).await? {
@@ -215,6 +216,9 @@ where
                 }
                 AuthStep::None => unreachable!(),
             };
+            if response.starts_with("235") {
+                authenticated = true;
+            }
             debug!("SMTP S: {}", response.trim_end());
             writer.write_all(response.as_bytes()).await?;
             continue;
@@ -286,6 +290,14 @@ where
             .next()
             .unwrap_or("")
             .to_uppercase();
+
+        if !authenticated && matches!(cmd.as_str(), "MAIL" | "RCPT" | "DATA") {
+            writer
+                .write_all(b"530 5.7.0 Authentication required\r\n")
+                .await?;
+            continue;
+        }
+
         let response = match cmd.as_str() {
             "EHLO" | "HELO" => {
                 state = SmtpState::Greeted;
@@ -295,7 +307,7 @@ where
             "AUTH" => {
                 let parts: Vec<&str> = trimmed.splitn(3, ' ').collect();
                 let auth_type = parts.get(1).unwrap_or(&"").to_uppercase();
-                match auth_type.as_str() {
+                let response = match auth_type.as_str() {
                     "PLAIN" => {
                         if let Some(data) = parts.get(2) {
                             verify_smtp_plain_data(data, &password_hash)
@@ -309,7 +321,11 @@ where
                         "334 VXNlcm5hbWU6\r\n".to_string()
                     }
                     _ => "504 Unrecognized auth type\r\n".to_string(),
+                };
+                if response.starts_with("235") {
+                    authenticated = true;
                 }
+                response
             }
             "MAIL" => {
                 if size_param_exceeds(trimmed, limits.max_message_bytes) {
@@ -695,6 +711,83 @@ mod tests {
         let resp = drain(&mut client).await;
         assert!(resp.starts_with("250"), "expected 250, got {resp:?}");
         assert_eq!(backend.sent(), 1, "normal message should be sent once");
+
+        client.write_all(b"QUIT\r\n").await.unwrap();
+        let _ = h.await;
+    }
+
+    #[tokio::test]
+    async fn rejects_mail_without_auth_when_password_configured() {
+        let (mut client, server) = tokio::io::duplex(64 * 1024);
+        let backend = Arc::new(CountingBackend::default());
+        let b = backend.clone();
+        let h = tokio::spawn(async move {
+            let _ = handle_connection(
+                server,
+                b as Arc<dyn MailBackend>,
+                Some("secret".to_string()),
+                SmtpLimits::default(),
+            )
+            .await;
+        });
+
+        assert!(drain(&mut client).await.starts_with("220"));
+        client.write_all(b"EHLO test\r\n").await.unwrap();
+        assert!(drain(&mut client).await.starts_with("250"));
+        client.write_all(b"MAIL FROM:<a@b.com>\r\n").await.unwrap();
+        let resp = drain(&mut client).await;
+        assert!(resp.starts_with("530"), "expected 530, got {resp:?}");
+
+        client.write_all(b"QUIT\r\n").await.unwrap();
+        let _ = h.await;
+        assert_eq!(
+            backend.sent(),
+            0,
+            "unauthenticated client must not send mail"
+        );
+    }
+
+    #[tokio::test]
+    async fn accepts_mail_after_successful_auth() {
+        let (mut client, server) = tokio::io::duplex(64 * 1024);
+        let backend = Arc::new(CountingBackend::default());
+        let b = backend.clone();
+        let h = tokio::spawn(async move {
+            let _ = handle_connection(
+                server,
+                b as Arc<dyn MailBackend>,
+                Some("secret".to_string()),
+                SmtpLimits::default(),
+            )
+            .await;
+        });
+
+        assert!(drain(&mut client).await.starts_with("220"));
+        client.write_all(b"EHLO test\r\n").await.unwrap();
+        assert!(drain(&mut client).await.starts_with("250"));
+
+        let creds = base64::engine::general_purpose::STANDARD.encode(b"\0user\0secret");
+        client
+            .write_all(format!("AUTH PLAIN {creds}\r\n").as_bytes())
+            .await
+            .unwrap();
+        assert!(drain(&mut client).await.starts_with("235"));
+
+        client.write_all(b"MAIL FROM:<a@b.com>\r\n").await.unwrap();
+        assert!(drain(&mut client).await.starts_with("250"));
+        client.write_all(b"RCPT TO:<c@d.com>\r\n").await.unwrap();
+        assert!(drain(&mut client).await.starts_with("250"));
+        client.write_all(b"DATA\r\n").await.unwrap();
+        assert!(drain(&mut client).await.starts_with("354"));
+        client
+            .write_all(b"Subject: hi\r\n\r\nshort body\r\n")
+            .await
+            .unwrap();
+        client.write_all(b".\r\n").await.unwrap();
+
+        let resp = drain(&mut client).await;
+        assert!(resp.starts_with("250"), "expected 250, got {resp:?}");
+        assert_eq!(backend.sent(), 1, "authenticated client should send mail");
 
         client.write_all(b"QUIT\r\n").await.unwrap();
         let _ = h.await;
