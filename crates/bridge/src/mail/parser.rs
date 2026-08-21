@@ -17,6 +17,11 @@ pub struct ParsedMessage {
     pub to: Vec<(String, String)>,
     pub cc: Vec<(String, String)>,
     pub bcc: Vec<(String, String)>,
+    /// `Reply-To`, when the submission set one. Carried through to
+    /// `DraftData.replyTos` so a reply goes where the sender asked rather
+    /// than to the bridge account -- which is the only route back to a
+    /// non-bridge address when the account cannot send as one.
+    pub reply_to: Vec<(String, String)>,
     pub subject: String,
     pub body_html: String,
     /// The body exactly as submitted, when the submission carried only a
@@ -58,6 +63,12 @@ pub fn parse_rfc2822(raw: &str) -> ParsedMessage {
     let bcc = get_header(&headers, "bcc")
         .map(|v| parse_address_list(&v))
         .unwrap_or_default();
+    // A list, not a single address: RFC 5322 §3.6.2 makes Reply-To an
+    // address-list, and `DraftData.replyTos` is a `Vec` for the same
+    // reason.
+    let reply_to = get_header(&headers, "reply-to")
+        .map(|v| parse_address_list(&v))
+        .unwrap_or_default();
 
     let subject = get_header(&headers, "subject")
         .map(|s| decode_header_value(&s))
@@ -97,6 +108,7 @@ pub fn parse_rfc2822(raw: &str) -> ParsedMessage {
         to,
         cc,
         bcc,
+        reply_to,
         subject,
         body_html,
         is_plaintext: body_text.is_some(),
@@ -661,6 +673,39 @@ mod tests {
         let raw = "From: a@b.com\r\nReferences: <root@x>\r\n <parent@x>\r\n\r\nbody";
         let msg = parse_rfc2822(raw);
         assert_eq!(msg.in_reply_to.as_deref(), Some("parent@x"));
+    }
+
+    #[test]
+    fn reply_to_is_extracted_with_name_and_address() {
+        let raw = "From: a@b.com\r\nReply-To: Paul Scarrone <paul@scarrone.co>\r\n\r\nbody";
+        let msg = parse_rfc2822(raw);
+        assert_eq!(
+            msg.reply_to,
+            vec![("Paul Scarrone".to_string(), "paul@scarrone.co".to_string())]
+        );
+    }
+
+    #[test]
+    fn reply_to_is_an_address_list() {
+        // RFC 5322 §3.6.2 makes this a list, and `DraftData.replyTos` is a
+        // Vec for the same reason -- so a second address must not be lost.
+        let raw = "From: a@b.com\r\nReply-To: one@x.com, Two <two@x.com>\r\n\r\nbody";
+        let msg = parse_rfc2822(raw);
+        assert_eq!(msg.reply_to.len(), 2);
+        assert_eq!(msg.reply_to[0].1, "one@x.com");
+        assert_eq!(
+            msg.reply_to[1],
+            ("Two".to_string(), "two@x.com".to_string())
+        );
+    }
+
+    #[test]
+    fn absent_reply_to_is_empty_not_the_from() {
+        // The whole point of the field: no Reply-To must stay no Reply-To,
+        // rather than quietly becoming the sender.
+        let raw = "From: a@b.com\r\n\r\nbody";
+        let msg = parse_rfc2822(raw);
+        assert!(msg.reply_to.is_empty());
     }
 
     #[test]

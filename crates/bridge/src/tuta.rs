@@ -12,8 +12,8 @@ use tutasdk::crypto_entity_client::CryptoEntityClient;
 use tutasdk::entities::generated::sys::BlobReferenceTokenWrapper;
 use tutasdk::entities::generated::tutanota::{
     AttachmentKeyData, ConversationEntry, DraftAttachment, DraftCreateData, DraftData,
-    DraftRecipient, Mail, MailBox, MailDetails, MailDetailsBlob, MailSetEntry, NewDraftAttachment,
-    SendDraftData, SendDraftParameters, TutanotaFile,
+    DraftRecipient, EncryptedMailAddress, Mail, MailBox, MailDetails, MailDetailsBlob,
+    MailSetEntry, NewDraftAttachment, SendDraftData, SendDraftParameters, TutanotaFile,
 };
 use tutasdk::folder_system::{FolderSystem, MailSetKind};
 use tutasdk::services::generated::tutanota::{DraftService, SendDraftService};
@@ -574,6 +574,46 @@ impl TutaSession {
             .collect())
     }
 
+    /// Pick the address this submission goes out as, and the mail group
+    /// that address belongs to.
+    ///
+    /// Returns the account's own address whenever `requested` is empty, is
+    /// the account address already, or is one this account may not send
+    /// as. The group id comes back alongside deliberately: it is the same
+    /// call that authorises the address, so a caller cannot end up holding
+    /// a group for one address and a sender for another.
+    async fn resolve_sender(
+        &self,
+        requested: &str,
+    ) -> Result<(String, tutasdk::GeneratedId), ApiCallError> {
+        let facade = self.logged_in.mail_facade();
+
+        let wants_other = !requested.is_empty() && !requested.eq_ignore_ascii_case(&self.email);
+
+        if wants_other {
+            match facade.get_group_id_for_mail_address(requested).await {
+                Ok(group) => return Ok((requested.to_string(), group)),
+                // Not an alias this account may send as. Every other error
+                // is a real failure and must not be swallowed -- falling
+                // back on a transport error would turn "the network is
+                // down" into a silently mis-addressed mail.
+                Err(ApiCallError::ServerResponseError { source })
+                    if matches!(source, tutasdk::rest_error::HttpError::NotFoundError) =>
+                {
+                    log::warn!(
+                        "sending as {} instead of {}: not an enabled alias on this account",
+                        self.email,
+                        requested
+                    );
+                }
+                Err(e) => return Err(e),
+            }
+        }
+
+        let group = facade.get_group_id_for_mail_address(&self.email).await?;
+        Ok((self.email.clone(), group))
+    }
+
     async fn send_mail_impl(&self, msg: &ParsedMessage) -> Result<(), ApiCallError> {
         // Pre-populate the self-send cache *before* we hit any Tuta API,
         // so the inbox-side WS event has zero chance of beating the
@@ -586,11 +626,22 @@ impl TutaSession {
         let randomizer = RandomizerFacade::from_core(rand_core::OsRng);
         let session_key: GenericAesKey = Aes256Key::generate(&randomizer).into();
 
-        let mail_group_id = self
-            .logged_in
-            .mail_facade()
-            .get_group_id_for_mail_address(&self.email)
-            .await?;
+        // Send as the address the submission asked for, when the account
+        // is entitled to it. `get_group_id_for_mail_address` is not just a
+        // lookup -- it walks the group's *enabled* aliases and returns
+        // `NotFoundError` for anything else (`mail_facade.rs`), so the
+        // account itself is the allowlist and there is no second one here
+        // to drift out of step with it.
+        //
+        // Falling back rather than failing, because a submission whose
+        // `From:` this account cannot use is the overwhelmingly common
+        // case (every MUA that fills it in from something other than the
+        // bridge address) and refusing it would break sending for anyone
+        // who never asked for this. The warning is what makes the
+        // difference visible: silently substituting the sender is exactly
+        // the behaviour that made this hard to diagnose from the outside,
+        // where the only symptom is the wrong name in a list archive.
+        let (sender_email, mail_group_id) = self.resolve_sender(&msg.from_address).await?;
         let group_key = self
             .logged_in
             .get_current_sym_group_key(&mail_group_id)
@@ -616,7 +667,7 @@ impl TutaSession {
             )
             .await?;
 
-        let draft_data = build_draft_data(msg, &self.email, added_attachments);
+        let draft_data = build_draft_data(msg, &sender_email, added_attachments);
 
         // Thread replies: a submission carrying In-Reply-To (git send-email
         // series, MUA replies) gets its reference resolved to an id the
@@ -1297,6 +1348,25 @@ fn delete_credentials(email: &str) {
 
 /// Map SMTP recipients to `DraftRecipient`, falling back to the address when
 /// the display name is empty (Tuta's send service rejects empty names).
+/// `Reply-To` addresses for the draft. Same empty-name rule as
+/// [`build_draft_recipients`] -- `SendDraftService` rejects an empty name
+/// on an address, so the address stands in for it.
+fn build_reply_tos(reply_to: &[(String, String)]) -> Vec<EncryptedMailAddress> {
+    reply_to
+        .iter()
+        .map(|(name, addr)| EncryptedMailAddress {
+            _id: None,
+            name: if name.is_empty() {
+                addr.clone()
+            } else {
+                name.clone()
+            },
+            address: addr.clone(),
+            _errors: Default::default(),
+        })
+        .collect()
+}
+
 fn build_draft_recipients(recipients: &[(String, String)]) -> Vec<DraftRecipient> {
     recipients
         .iter()
@@ -1348,7 +1418,7 @@ fn build_draft_data(
         bccRecipients: build_draft_recipients(&msg.bcc),
         addedAttachments: added_attachments,
         removedAttachments: vec![],
-        replyTos: vec![],
+        replyTos: build_reply_tos(&msg.reply_to),
         _errors: Default::default(),
     }
 }
@@ -1465,6 +1535,7 @@ mod self_send_cache_tests {
             to: vec![("".to_string(), to.to_string())],
             cc: vec![],
             bcc: vec![],
+            reply_to: vec![],
             subject: subject.to_string(),
             body_html: "<p>body</p>".to_string(),
             body_text: None,
@@ -1580,6 +1651,7 @@ mod send_tests {
             to: vec![("Bob".to_string(), "bob@example.com".to_string())],
             cc: vec![],
             bcc: vec![],
+            reply_to: vec![],
             subject: "Hi".to_string(),
             body_html: "<p>hello</p>".to_string(),
             body_text: None,
@@ -1632,6 +1704,43 @@ mod send_tests {
         let patch = "diff --git a/x.c b/x.c\n-if (a < b && c > d)\n+while (p != NULL)\n\t\"quoted\"  two  spaces\n";
         let stored = plaintext_to_tuta_html(patch);
         assert_eq!(crate::mail::rfc2822::html_to_text(&stored), patch);
+    }
+
+    #[test]
+    fn draft_data_carries_reply_to() {
+        let mut msg = sample_msg();
+        msg.reply_to = vec![("Paul".to_string(), "paul@scarrone.co".to_string())];
+        let d = build_draft_data(&msg, "me@tuta.io", vec![]);
+        assert_eq!(d.replyTos.len(), 1);
+        assert_eq!(d.replyTos[0].address, "paul@scarrone.co");
+        assert_eq!(d.replyTos[0].name, "Paul");
+    }
+
+    #[test]
+    fn draft_data_reply_to_empty_name_falls_back_to_address() {
+        // `SendDraftService` rejects an empty name on an address, the same
+        // rule `build_draft_recipients` already follows.
+        let mut msg = sample_msg();
+        msg.reply_to = vec![("".to_string(), "paul@scarrone.co".to_string())];
+        let d = build_draft_data(&msg, "me@tuta.io", vec![]);
+        assert_eq!(d.replyTos[0].name, "paul@scarrone.co");
+    }
+
+    #[test]
+    fn draft_data_without_reply_to_sends_none() {
+        let d = build_draft_data(&sample_msg(), "me@tuta.io", vec![]);
+        assert!(d.replyTos.is_empty());
+    }
+
+    #[test]
+    fn draft_data_sender_is_the_resolved_address_not_the_from() {
+        // `build_draft_data` takes the sender its caller resolved, which is
+        // the account address whenever the requested one was refused. The
+        // submission's own `From:` must not leak past that decision.
+        let mut msg = sample_msg();
+        msg.from_address = "paul@scarrone.co".to_string();
+        let d = build_draft_data(&msg, "me@tuta.io", vec![]);
+        assert_eq!(d.senderMailAddress, "me@tuta.io");
     }
 
     #[test]
