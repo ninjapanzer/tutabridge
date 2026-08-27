@@ -55,20 +55,12 @@ pub fn parse_rfc2822(raw: &str) -> ParsedMessage {
     let from_raw = get_header(&headers, "from").unwrap_or_default();
     let (from_name, from_address) = parse_address_single(&from_raw);
 
-    let to = get_header(&headers, "to")
-        .map(|v| parse_address_list(&v))
-        .unwrap_or_default();
-    let cc = get_header(&headers, "cc")
-        .map(|v| parse_address_list(&v))
-        .unwrap_or_default();
-    let bcc = get_header(&headers, "bcc")
-        .map(|v| parse_address_list(&v))
-        .unwrap_or_default();
-    // A list, not a single address: RFC 5322 §3.6.2 makes Reply-To an
-    // address-list.
-    let reply_to = get_header(&headers, "reply-to")
-        .map(|v| parse_address_list(&v))
-        .unwrap_or_default();
+    let AddressHeaders {
+        to,
+        cc,
+        bcc,
+        reply_to,
+    } = address_headers_of(&headers);
 
     let subject = get_header(&headers, "subject")
         .map(|s| decode_header_value(&s))
@@ -119,6 +111,37 @@ pub fn parse_rfc2822(raw: &str) -> ParsedMessage {
     }
 }
 
+/// The address-list headers of a message, as `(name, address)` pairs with
+/// display names decoded. A header that is absent yields an empty list.
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
+pub(crate) struct AddressHeaders {
+    pub to: Vec<(String, String)>,
+    pub cc: Vec<(String, String)>,
+    pub bcc: Vec<(String, String)>,
+    /// RFC 5322 §3.6.2 makes Reply-To an address-list, not a single address.
+    pub reply_to: Vec<(String, String)>,
+}
+
+/// The address-list headers of a rendered message. Reads the header section
+/// only, so it is cheap on a message with a large body.
+pub(crate) fn parse_address_headers(raw: &str) -> AddressHeaders {
+    address_headers_of(&parse_headers(header_section(raw)))
+}
+
+fn address_headers_of(headers: &[(String, String)]) -> AddressHeaders {
+    let list = |name: &str| {
+        get_header(headers, name)
+            .map(|v| parse_address_list(&v))
+            .unwrap_or_default()
+    };
+    AddressHeaders {
+        to: list("to"),
+        cc: list("cc"),
+        bcc: list("bcc"),
+        reply_to: list("reply-to"),
+    }
+}
+
 /// All RFC 5322 msg-ids in a header value, angle brackets stripped. A value
 /// with no `<...>` spans (some MUAs write bare ids) yields the trimmed value
 /// itself, if non-empty.
@@ -154,13 +177,20 @@ fn last_msg_id(raw: &str) -> Option<String> {
 }
 
 pub(super) fn split_headers_body(raw: &str) -> (String, String) {
-    if let Some(pos) = raw.find("\r\n\r\n") {
-        (raw[..pos].to_string(), raw[pos + 4..].to_string())
-    } else if let Some(pos) = raw.find("\n\n") {
-        (raw[..pos].to_string(), raw[pos + 2..].to_string())
-    } else {
-        (raw.to_string(), String::new())
-    }
+    let headers = header_section(raw);
+    let body = raw[headers.len()..]
+        .strip_prefix("\r\n\r\n")
+        .or_else(|| raw[headers.len()..].strip_prefix("\n\n"))
+        .unwrap_or("");
+    (headers.to_string(), body.to_string())
+}
+
+/// The header section of a message: everything before the first blank line,
+/// CRLF or bare LF. The whole message when there is none.
+fn header_section(raw: &str) -> &str {
+    raw.find("\r\n\r\n")
+        .or_else(|| raw.find("\n\n"))
+        .map_or(raw, |pos| &raw[..pos])
 }
 
 pub(super) fn parse_headers(header_section: &str) -> Vec<(String, String)> {
@@ -199,16 +229,37 @@ pub(super) fn get_header(headers: &[(String, String)], name: &str) -> Option<Str
         .map(|(_, v)| v.clone())
 }
 
+/// One mailbox: `Name <addr>` or a bare `addr`. The angle-addr is the last
+/// `<`…`>` pair, since a quoted display name may itself hold `<` or `>`
+/// (`"a > b" <x@y>` used to slice backwards and panic).
 fn parse_address_single(raw: &str) -> (String, String) {
     let raw = raw.trim();
-    if let Some(lt) = raw.find('<') {
-        if let Some(gt) = raw.find('>') {
-            let addr = raw[lt + 1..gt].trim().to_string();
-            let name = decode_header_value(raw[..lt].trim().trim_matches('"'));
+    if let Some(lt) = raw.rfind('<') {
+        if let Some(gt) = raw[lt..].find('>') {
+            let addr = raw[lt + 1..lt + gt].trim().to_string();
+            let name = decode_header_value(&unquote(raw[..lt].trim()));
             return (name, addr);
         }
     }
     (String::new(), raw.to_string())
+}
+
+/// Strip the quotes of an RFC 5322 quoted-string and undo its `\\` escapes.
+/// A phrase that is not one whole quoted-string only loses stray quotes at
+/// its ends, as sloppy senders write `"John <j@x>` and mean `John`.
+fn unquote(phrase: &str) -> String {
+    let Some(inner) = phrase.strip_prefix('"').and_then(|p| p.strip_suffix('"')) else {
+        return phrase.trim_matches('"').to_string();
+    };
+    let mut out = String::with_capacity(inner.len());
+    let mut chars = inner.chars();
+    while let Some(c) = chars.next() {
+        match c {
+            '\\' => out.extend(chars.next()),
+            _ => out.push(c),
+        }
+    }
+    out
 }
 
 fn parse_address_list(raw: &str) -> Vec<(String, String)> {
@@ -217,7 +268,8 @@ fn parse_address_list(raw: &str) -> Vec<(String, String)> {
     let mut in_quotes = false;
     let mut current = String::new();
 
-    for ch in raw.chars() {
+    let mut chars = raw.chars();
+    while let Some(ch) = chars.next() {
         match ch {
             // A quoted display name may contain commas and angle brackets that
             // are NOT list separators, e.g. `"Doe, John" <j@x.com>`. Track the
@@ -226,6 +278,12 @@ fn parse_address_list(raw: &str) -> Vec<(String, String)> {
             '"' => {
                 in_quotes = !in_quotes;
                 current.push(ch);
+            }
+            // An escaped character inside the quoted-string (`\\"`, `\\\\`) is
+            // not a delimiter: keep the pair and leave the quote state alone.
+            '\\' if in_quotes => {
+                current.push(ch);
+                current.extend(chars.next());
             }
             '<' if !in_quotes => {
                 depth += 1;
@@ -946,5 +1004,92 @@ mod tests {
         let input = "caf=C3=A9";
         let result = decode_quoted_printable(input);
         assert_eq!(result, "caf\u{e9}");
+    }
+
+    #[test]
+    fn address_headers_come_from_the_header_section_only() {
+        // Folded To, encoded Cc name, Reply-To list; the body's "To:" line and
+        // the missing Bcc must not leak in.
+        let raw = "From: a@b.com\r\nTo: Bob <bob@x.com>,\r\n charlie@x.com\r\nCc: =?UTF-8?B?Wm/Dqw==?= <zoe@x.com>\r\nReply-To: one@x.com, Two <two@x.com>\r\n\r\nTo: not-a-header@x.com";
+        let parsed = parse_address_headers(raw);
+        assert_eq!(
+            parsed,
+            AddressHeaders {
+                to: vec![
+                    ("Bob".to_string(), "bob@x.com".to_string()),
+                    (String::new(), "charlie@x.com".to_string()),
+                ],
+                cc: vec![("Zoë".to_string(), "zoe@x.com".to_string())],
+                bcc: vec![],
+                reply_to: vec![
+                    (String::new(), "one@x.com".to_string()),
+                    ("Two".to_string(), "two@x.com".to_string()),
+                ],
+            }
+        );
+    }
+
+    #[test]
+    fn address_headers_of_a_message_without_any_are_empty() {
+        assert_eq!(
+            parse_address_headers("Subject: hi\r\n\r\nbody"),
+            AddressHeaders::default()
+        );
+    }
+
+    #[test]
+    fn angle_brackets_inside_a_quoted_name_do_not_break_the_mailbox() {
+        // A `>` before the `<` used to slice backwards and panic the parser.
+        let raw = "From: \"a > b\" <x@y.com>\r\nTo: \"c <d>\" <e@f.com>, g@h.com\r\n\r\n";
+        let msg = parse_rfc2822(raw);
+        assert_eq!(
+            (msg.from_name.as_str(), msg.from_address.as_str()),
+            ("a > b", "x@y.com")
+        );
+        assert_eq!(
+            msg.to,
+            vec![
+                ("c <d>".to_string(), "e@f.com".to_string()),
+                (String::new(), "g@h.com".to_string()),
+            ]
+        );
+    }
+
+    #[test]
+    fn quoted_name_escapes_are_undone() {
+        let raw = "From: \"Say \\\"hi\\\" \\\\ bye.\" <a@b.c>\r\n\r\n";
+        let msg = parse_rfc2822(raw);
+        assert_eq!(msg.from_name, "Say \"hi\" \\ bye.");
+        assert_eq!(msg.from_address, "a@b.c");
+    }
+
+    #[test]
+    fn escaped_quotes_inside_a_quoted_name_do_not_split_the_list() {
+        let raw = "To: \"5\\\" screen, big\" <a@b.c>, x@y.z\r\n\r\n";
+        assert_eq!(
+            parse_rfc2822(raw).to,
+            vec![
+                ("5\" screen, big".to_string(), "a@b.c".to_string()),
+                (String::new(), "x@y.z".to_string()),
+            ]
+        );
+    }
+
+    #[test]
+    fn stray_quotes_around_a_name_are_still_trimmed() {
+        let msg = parse_rfc2822("From: \"John <j@x.com>\r\n\r\n");
+        assert_eq!(
+            (msg.from_name.as_str(), msg.from_address.as_str()),
+            ("John", "j@x.com")
+        );
+    }
+
+    #[test]
+    fn address_headers_accept_a_bare_lf_message() {
+        // Same separator rules as parse_rfc2822: the body's "To:" is not a header.
+        assert_eq!(
+            parse_address_headers("To: a@b.c\n\nTo: not-a-header@x.y").to,
+            vec![(String::new(), "a@b.c".to_string())]
+        );
     }
 }
