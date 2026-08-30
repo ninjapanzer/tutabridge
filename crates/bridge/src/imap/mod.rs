@@ -3,6 +3,7 @@ mod session;
 mod utf7;
 
 use log::{debug, error, info};
+use std::io::ErrorKind;
 use std::sync::Arc;
 use tokio::io::{AsyncBufRead, AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
 use tokio::net::TcpListener;
@@ -57,6 +58,17 @@ pub async fn serve(
     Ok(())
 }
 
+/// True for the io::Error rustls reports when a peer closes the TCP
+/// connection without sending a TLS close_notify alert first. Under TLS 1.3's
+/// AEAD framing this can't hide a truncated response the way it could
+/// pre-1.3, and short-lived clients that open a connection, run one command
+/// and exit (as most non-interactive IMAP CLI tools do) routinely skip the
+/// clean shutdown. Treating it as an ordinary EOF keeps that common,
+/// harmless case out of the error log.
+fn is_close_notify_eof(e: &std::io::Error) -> bool {
+    e.kind() == ErrorKind::UnexpectedEof
+}
+
 async fn handle_connection(
     stream: tokio_rustls::server::TlsStream<tokio::net::TcpStream>,
     store: Arc<MailStore>,
@@ -80,7 +92,14 @@ async fn handle_connection(
             line.clear();
             tokio::select! {
                 result = reader.read_line(&mut line) => {
-                    let n = result?;
+                    let n = match result {
+                        Ok(n) => n,
+                        Err(e) if is_close_notify_eof(&e) => {
+                            debug!("IMAP client disconnected without a TLS close_notify while idle: {e}");
+                            break;
+                        }
+                        Err(e) => return Err(e.into()),
+                    };
                     if n == 0 {
                         break;
                     }
@@ -108,7 +127,14 @@ async fn handle_connection(
         }
 
         line.clear();
-        let n = reader.read_line(&mut line).await?;
+        let n = match reader.read_line(&mut line).await {
+            Ok(n) => n,
+            Err(e) if is_close_notify_eof(&e) => {
+                debug!("IMAP client disconnected without a TLS close_notify: {e}");
+                break;
+            }
+            Err(e) => return Err(e.into()),
+        };
         if n == 0 {
             break;
         }
@@ -278,6 +304,21 @@ mod tests {
         };
         store.set_folder_list(vec![sent]).await;
         ImapSession::new(store, Arc::new(NoopBackend), None, None)
+    }
+
+    #[test]
+    fn close_notify_eof_is_recognized() {
+        let e = std::io::Error::new(
+            ErrorKind::UnexpectedEof,
+            "peer closed connection without sending TLS close_notify",
+        );
+        assert!(is_close_notify_eof(&e));
+    }
+
+    #[test]
+    fn other_io_errors_are_not_treated_as_close_notify() {
+        let e = std::io::Error::new(ErrorKind::ConnectionReset, "connection reset by peer");
+        assert!(!is_close_notify_eof(&e));
     }
 
     #[tokio::test]
