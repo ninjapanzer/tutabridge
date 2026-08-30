@@ -46,6 +46,10 @@ pub struct ImapSession {
     idle_tag: Option<String>,
     auth_tag: Option<String>,
     password_hash: Option<String>,
+    /// Log-correlation id for the connection this session belongs to (see
+    /// `imap::SESSION_COUNTER`). `0` in unit tests, which construct a session
+    /// with no connection behind it.
+    session_id: u64,
 }
 
 impl ImapSession {
@@ -66,7 +70,15 @@ impl ImapSession {
             idle_tag: None,
             auth_tag: None,
             password_hash,
+            session_id: 0,
         }
+    }
+
+    /// Tags this session's log lines with a connection id so they can be
+    /// paired with the open/close lines logged around it in `imap::mod`.
+    pub fn with_session_id(mut self, session_id: u64) -> Self {
+        self.session_id = session_id;
+        self
     }
 
     pub fn is_logout(&self) -> bool {
@@ -121,7 +133,10 @@ impl ImapSession {
         }
 
         self.state = State::Authenticated;
-        info!("IMAP client authenticated via AUTHENTICATE PLAIN");
+        info!(
+            "IMAP session {}: authenticated via AUTHENTICATE PLAIN",
+            self.session_id
+        );
         vec![format!("{} OK AUTHENTICATE completed\r\n", tag)]
     }
 
@@ -275,7 +290,10 @@ impl ImapSession {
             }
         }
         self.state = State::Authenticated;
-        info!("IMAP client authenticated (bridge session)");
+        info!(
+            "IMAP session {}: authenticated (bridge session)",
+            self.session_id
+        );
         vec![format!("{} OK LOGIN completed\r\n", tag)]
     }
 
