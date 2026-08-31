@@ -331,6 +331,20 @@ mod tests {
         }
     }
 
+    #[test]
+    fn session_counter_yields_unique_increasing_ids() {
+        let a = SESSION_COUNTER.fetch_add(1, Ordering::Relaxed);
+        let b = SESSION_COUNTER.fetch_add(1, Ordering::Relaxed);
+        assert_ne!(
+            a, b,
+            "concurrent connections must not share a log-correlation id"
+        );
+        assert!(
+            b > a,
+            "ids must keep increasing so the newest connection is easy to spot in logs"
+        );
+    }
+
     async fn session_with_sent() -> ImapSession {
         let store = MailStore::new();
         let sent = FolderInfo {

@@ -2793,6 +2793,21 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn with_session_id_tags_the_session_for_log_correlation() {
+        let backend = Arc::new(MockBackend::new());
+        let (_store, session) = make_session(backend).await;
+        assert_eq!(
+            session.session_id, 0,
+            "a session built without with_session_id() is untagged (matches unit-test construction)"
+        );
+
+        let backend = Arc::new(MockBackend::new());
+        let (_store, session) = make_session(backend).await;
+        let session = session.with_session_id(42);
+        assert_eq!(session.session_id, 42);
+    }
+
+    #[tokio::test]
     async fn test_logout() {
         let backend = Arc::new(MockBackend::new());
         let (_store, mut session) = make_session(backend).await;
