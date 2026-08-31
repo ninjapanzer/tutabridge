@@ -380,8 +380,8 @@ mod tests {
         let (_watch_tx, mut store_watch) = watch::channel(0u64);
         let mut session = ImapSession::new(store, Arc::new(NoopBackend), None, None);
 
-        let result = run_connection_loop(&mut reader, &mut writer, &mut session, &mut store_watch)
-            .await;
+        let result =
+            run_connection_loop(&mut reader, &mut writer, &mut session, &mut store_watch).await;
 
         assert!(
             result.is_ok(),
