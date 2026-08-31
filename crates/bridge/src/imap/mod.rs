@@ -4,6 +4,7 @@ mod utf7;
 
 use log::{debug, error, info};
 use std::io::ErrorKind;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use tokio::io::{AsyncBufRead, AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
 use tokio::net::TcpListener;
@@ -14,6 +15,12 @@ use crate::store::LocalStore;
 use crate::sync::MailStore;
 use crate::tuta::MailBackend;
 use session::ImapSession;
+
+/// Numbers IMAP connections in acceptance order so log lines from concurrent
+/// or overlapping sessions (auth, commands, the eventual disconnect) can be
+/// told apart. Purely a log-correlation id — never persisted, never sent to
+/// a client.
+static SESSION_COUNTER: AtomicU64 = AtomicU64::new(1);
 
 pub async fn serve(
     port: u16,
@@ -30,25 +37,35 @@ pub async fn serve(
         listener,
         "IMAP",
         crate::net::MAX_CONNECTIONS,
-        move |stream, _addr| {
+        move |stream, addr| {
             let store = store.clone();
             let backend = backend.clone();
             let local_store = local_store.clone();
             let tls = tls.clone();
             let pw_hash = password_hash.clone();
             async move {
+                let session_id = SESSION_COUNTER.fetch_add(1, Ordering::Relaxed);
                 match tokio::time::timeout(crate::net::HANDSHAKE_TIMEOUT, tls.accept(stream)).await
                 {
                     Ok(Ok(tls_stream)) => {
-                        if let Err(e) =
-                            handle_connection(tls_stream, store, backend, local_store, pw_hash)
-                                .await
+                        info!("IMAP session {session_id}: opened ({addr})");
+                        if let Err(e) = handle_connection(
+                            tls_stream,
+                            session_id,
+                            store,
+                            backend,
+                            local_store,
+                            pw_hash,
+                        )
+                        .await
                         {
-                            error!("IMAP connection error: {}", e);
+                            error!("IMAP session {session_id}: connection error: {e}");
                         }
                     }
-                    Ok(Err(e)) => error!("IMAP TLS handshake failed: {}", e),
-                    Err(_) => debug!("IMAP TLS handshake timed out"),
+                    Ok(Err(e)) => {
+                        error!("IMAP session {session_id}: TLS handshake failed ({addr}): {e}")
+                    }
+                    Err(_) => debug!("IMAP session {session_id}: TLS handshake timed out ({addr})"),
                 }
             }
         },
@@ -71,6 +88,7 @@ fn is_close_notify_eof(e: &std::io::Error) -> bool {
 
 async fn handle_connection(
     stream: tokio_rustls::server::TlsStream<tokio::net::TcpStream>,
+    session_id: u64,
     store: Arc<MailStore>,
     backend: Arc<dyn MailBackend>,
     local_store: Arc<LocalStore>,
@@ -79,7 +97,8 @@ async fn handle_connection(
     let (reader, mut writer) = tokio::io::split(stream);
     let mut reader = BufReader::new(reader);
     let mut store_watch: watch::Receiver<u64> = store.subscribe();
-    let mut session = ImapSession::new(store, backend, password_hash, Some(local_store));
+    let mut session = ImapSession::new(store, backend, password_hash, Some(local_store))
+        .with_session_id(session_id);
 
     writer
         .write_all(b"* OK TutaBridge IMAP4rev1 ready\r\n")
@@ -102,6 +121,7 @@ where
     R: AsyncBufRead + Unpin,
     W: AsyncWriteExt + Unpin,
 {
+    let session_id = session.session_id();
     let mut line = String::new();
     loop {
         if session.is_idle() {
@@ -111,12 +131,13 @@ where
                     let n = match result {
                         Ok(n) => n,
                         Err(e) if is_close_notify_eof(&e) => {
-                            debug!("IMAP client disconnected without a TLS close_notify while idle: {e}");
+                            debug!("IMAP session {session_id}: ended, client disconnected without a TLS close_notify while idle: {e}");
                             break;
                         }
                         Err(e) => return Err(e.into()),
                     };
                     if n == 0 {
+                        info!("IMAP session {session_id}: ended, client disconnected cleanly while idle");
                         break;
                     }
                     let trimmed = line.trim_end();
@@ -146,12 +167,13 @@ where
         let n = match reader.read_line(&mut line).await {
             Ok(n) => n,
             Err(e) if is_close_notify_eof(&e) => {
-                debug!("IMAP client disconnected without a TLS close_notify: {e}");
+                debug!("IMAP session {session_id}: ended, client disconnected without a TLS close_notify: {e}");
                 break;
             }
             Err(e) => return Err(e.into()),
         };
         if n == 0 {
+            info!("IMAP session {session_id}: ended, client disconnected cleanly");
             break;
         }
 
@@ -179,6 +201,7 @@ where
         writer.flush().await?;
 
         if session.is_logout() {
+            info!("IMAP session {session_id}: ended, client sent LOGOUT");
             break;
         }
     }
