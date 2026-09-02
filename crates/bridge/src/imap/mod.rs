@@ -3,6 +3,7 @@ mod session;
 mod utf7;
 
 use log::{debug, error, info};
+use std::io::ErrorKind;
 use std::sync::Arc;
 use tokio::io::{AsyncBufRead, AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
 use tokio::net::TcpListener;
@@ -57,6 +58,17 @@ pub async fn serve(
     Ok(())
 }
 
+/// True for the io::Error rustls reports when a peer closes the TCP
+/// connection without sending a TLS close_notify alert first. Under TLS 1.3's
+/// AEAD framing this can't hide a truncated response the way it could
+/// pre-1.3, and short-lived clients that open a connection, run one command
+/// and exit (as most non-interactive IMAP CLI tools do) routinely skip the
+/// clean shutdown. Treating it as an ordinary EOF keeps that common,
+/// harmless case out of the error log.
+fn is_close_notify_eof(e: &std::io::Error) -> bool {
+    e.kind() == ErrorKind::UnexpectedEof
+}
+
 async fn handle_connection(
     stream: tokio_rustls::server::TlsStream<tokio::net::TcpStream>,
     store: Arc<MailStore>,
@@ -74,13 +86,36 @@ async fn handle_connection(
         .await?;
     writer.flush().await?;
 
+    run_connection_loop(&mut reader, &mut writer, &mut session, &mut store_watch).await
+}
+
+/// The command loop shared by every IMAP connection, kept generic over the
+/// stream so it can run against a `tokio::io::duplex` in tests without a real
+/// TLS handshake — `handle_connection` supplies the concrete `TlsStream`.
+async fn run_connection_loop<R, W>(
+    reader: &mut R,
+    writer: &mut W,
+    session: &mut ImapSession,
+    store_watch: &mut watch::Receiver<u64>,
+) -> Result<(), Box<dyn std::error::Error + Send + Sync>>
+where
+    R: AsyncBufRead + Unpin,
+    W: AsyncWriteExt + Unpin,
+{
     let mut line = String::new();
     loop {
         if session.is_idle() {
             line.clear();
             tokio::select! {
                 result = reader.read_line(&mut line) => {
-                    let n = result?;
+                    let n = match result {
+                        Ok(n) => n,
+                        Err(e) if is_close_notify_eof(&e) => {
+                            debug!("IMAP client disconnected without a TLS close_notify while idle: {e}");
+                            break;
+                        }
+                        Err(e) => return Err(e.into()),
+                    };
                     if n == 0 {
                         break;
                     }
@@ -108,7 +143,14 @@ async fn handle_connection(
         }
 
         line.clear();
-        let n = reader.read_line(&mut line).await?;
+        let n = match reader.read_line(&mut line).await {
+            Ok(n) => n,
+            Err(e) if is_close_notify_eof(&e) => {
+                debug!("IMAP client disconnected without a TLS close_notify: {e}");
+                break;
+            }
+            Err(e) => return Err(e.into()),
+        };
         if n == 0 {
             break;
         }
@@ -120,7 +162,7 @@ async fn handle_connection(
         // read, so it is handled here at the socket level.
         if !session.is_awaiting_auth() {
             if let Some(req) = session::parse_append(trimmed) {
-                handle_append(&mut reader, &mut writer, &session, req).await?;
+                handle_append(reader, writer, session, req).await?;
                 continue;
             }
         }
@@ -278,6 +320,73 @@ mod tests {
         };
         store.set_folder_list(vec![sent]).await;
         ImapSession::new(store, Arc::new(NoopBackend), None, None)
+    }
+
+    #[test]
+    fn close_notify_eof_is_recognized() {
+        let e = std::io::Error::new(
+            ErrorKind::UnexpectedEof,
+            "peer closed connection without sending TLS close_notify",
+        );
+        assert!(is_close_notify_eof(&e));
+    }
+
+    #[test]
+    fn other_io_errors_are_not_treated_as_close_notify() {
+        let e = std::io::Error::new(ErrorKind::ConnectionReset, "connection reset by peer");
+        assert!(!is_close_notify_eof(&e));
+    }
+
+    /// Replays a fixed script of reads: each entry is either a chunk of bytes
+    /// or an error to return, one per `poll_read` call. Lets a test drive the
+    /// connection loop through a scenario a real socket can produce (like a
+    /// close_notify-less disconnect) without a TLS handshake.
+    struct ScriptedReader {
+        script: std::collections::VecDeque<std::io::Result<Vec<u8>>>,
+    }
+
+    impl tokio::io::AsyncRead for ScriptedReader {
+        fn poll_read(
+            mut self: std::pin::Pin<&mut Self>,
+            _cx: &mut std::task::Context<'_>,
+            buf: &mut tokio::io::ReadBuf<'_>,
+        ) -> std::task::Poll<std::io::Result<()>> {
+            match self.script.pop_front() {
+                Some(Ok(chunk)) => {
+                    buf.put_slice(&chunk);
+                    std::task::Poll::Ready(Ok(()))
+                }
+                Some(Err(e)) => std::task::Poll::Ready(Err(e)),
+                None => std::task::Poll::Ready(Ok(())), // EOF: no more scripted reads
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn connection_loop_ends_quietly_when_client_vanishes_after_login() {
+        // Mirrors the scenario that used to log a false-alarm ERROR: a client
+        // logs in and then just disappears (no LOGOUT, no TLS close_notify) —
+        // e.g. a one-shot CLI tool that runs a single command and exits.
+        let mut script = std::collections::VecDeque::new();
+        script.push_back(Ok(b"a1 LOGIN \"user\" \"pass\"\r\n".to_vec()));
+        script.push_back(Err(std::io::Error::new(
+            ErrorKind::UnexpectedEof,
+            "peer closed connection without sending TLS close_notify",
+        )));
+        let reader = ScriptedReader { script };
+        let mut reader = BufReader::new(reader);
+        let mut writer = tokio::io::sink();
+        let store = MailStore::new();
+        let (_watch_tx, mut store_watch) = watch::channel(0u64);
+        let mut session = ImapSession::new(store, Arc::new(NoopBackend), None, None);
+
+        let result =
+            run_connection_loop(&mut reader, &mut writer, &mut session, &mut store_watch).await;
+
+        assert!(
+            result.is_ok(),
+            "a close_notify-less disconnect must end the session quietly, not as an error: {result:?}"
+        );
     }
 
     #[tokio::test]
