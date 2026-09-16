@@ -1,4 +1,4 @@
 [submodule "tuta-repo"]
 	path = tuta-repo
-	url = https://github.com/spartanz51/tutanota.git
+	url = https://github.com/ninjapanzer/tutanota.git
 	branch = tutabridge-integration
