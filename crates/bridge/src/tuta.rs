@@ -1206,10 +1206,25 @@ pub async fn login_with_2fa(
                     sent_id_cache: Arc::new(tokio::sync::Mutex::new(HashMap::new())),
                 });
             }
-            Err(e) => {
-                log::warn!("Session expired, re-authenticating: {e}");
-                delete_credentials(&cfg.email);
-            }
+            Err(e) => match classify_resume_failure(&e) {
+                ResumeFailure::SessionInvalid => {
+                    log::warn!("Saved session is no longer valid, re-authenticating: {e}");
+                    delete_credentials(&cfg.email);
+                }
+                ResumeFailure::ClientRejected => {
+                    return Err(format!(
+                        "Tuta rejects this version of the bridge ({e}); update the bridge. \
+                         The saved session was kept."
+                    )
+                    .into());
+                }
+                ResumeFailure::Transient => {
+                    return Err(format!(
+                        "Could not resume the saved session ({e}); it was kept, try again later."
+                    )
+                    .into());
+                }
+            },
         }
     }
 
@@ -1293,6 +1308,47 @@ const KEYRING_SERVICE: &str = "tutabridge";
 use std::sync::Mutex;
 static CREDENTIALS_CACHE: Mutex<Option<Option<tutasdk::login::Credentials>>> = Mutex::new(None);
 
+/// What a failed resume of a saved session says about that session.
+#[derive(Debug, PartialEq, Eq)]
+enum ResumeFailure {
+    /// Tuta no longer accepts the token or the account behind it: forget the
+    /// session and log in again.
+    SessionInvalid,
+    /// Tuta refuses this client version (HTTP 474) before looking at the
+    /// token. The session may well be fine; only an update can help.
+    ClientRejected,
+    /// Network, server or anything unexpected: the session is not the problem.
+    Transient,
+}
+
+/// Decide whether a failed resume means the saved session is dead. Only a
+/// verdict on the token or the account is; a 474 or an outage says nothing
+/// about the session, and forgetting it on those made every Tuta hiccup a
+/// password-and-TOTP prompt.
+fn classify_resume_failure(e: &tutasdk::login::LoginError) -> ResumeFailure {
+    use tutasdk::login::LoginError;
+    use tutasdk::rest_error::HttpError;
+    use tutasdk::ApiCallError;
+    match e {
+        // The stored token or key cannot be used at all.
+        LoginError::InvalidAccessToken { .. }
+        | LoginError::InvalidPassphrase { .. }
+        | LoginError::InvalidKey { .. } => ResumeFailure::SessionInvalid,
+        LoginError::ApiCall {
+            source: ApiCallError::ServerResponseError { source },
+        } => match source {
+            HttpError::NotAuthenticatedError
+            | HttpError::SessionExpiredError
+            | HttpError::AccessExpiredError
+            | HttpError::AccessDeactivatedError
+            | HttpError::AccessBlockedError => ResumeFailure::SessionInvalid,
+            HttpError::InvalidSoftwareVersionError => ResumeFailure::ClientRejected,
+            _ => ResumeFailure::Transient,
+        },
+        LoginError::ApiCall { .. } => ResumeFailure::Transient,
+    }
+}
+
 pub fn has_saved_session(email: &str) -> bool {
     load_credentials(email).is_some()
 }
@@ -1358,11 +1414,19 @@ fn load_credentials_from_keyring(email: &str) -> Option<tutasdk::login::Credenti
     })
 }
 
+/// Forget a saved session the server has judged dead. The cache is set to
+/// "loaded, nothing there" rather than "not loaded": the verdict stands for
+/// this process even if the keyring refuses the deletion, so a rejected token
+/// is never read back and retried. A leftover entry is overwritten by the
+/// next successful login.
 fn delete_credentials(email: &str) {
-    if let Ok(entry) = keyring::Entry::new(KEYRING_SERVICE, email) {
-        let _ = entry.delete_credential();
+    match keyring::Entry::new(KEYRING_SERVICE, email).and_then(|e| e.delete_credential()) {
+        Ok(()) | Err(keyring::Error::NoEntry) => {}
+        Err(e) => log::warn!(
+            "Could not remove the stale session from the keyring ({e}); it will be replaced on the next login"
+        ),
     }
-    *CREDENTIALS_CACHE.lock().unwrap() = None;
+    *CREDENTIALS_CACHE.lock().unwrap() = Some(None);
 }
 
 /// Map SMTP recipients to `DraftRecipient`, falling back to the address when
@@ -1526,6 +1590,128 @@ fn build_send_draft_data(
             symEncInternalRecipientKeyData: vec![],
             attachmentKeyData: attachment_key_data,
         }),
+    }
+}
+
+#[cfg(test)]
+mod resume_failure_tests {
+    use super::{classify_resume_failure, ResumeFailure};
+    use tutasdk::bindings::rest_client::RestClientError;
+    use tutasdk::login::LoginError;
+    use tutasdk::rest_error::HttpError;
+    use tutasdk::ApiCallError;
+
+    fn server(source: HttpError) -> LoginError {
+        LoginError::ApiCall {
+            source: ApiCallError::ServerResponseError { source },
+        }
+    }
+
+    #[test]
+    fn a_verdict_on_the_token_or_account_invalidates_the_session() {
+        for e in [
+            server(HttpError::NotAuthenticatedError),
+            server(HttpError::SessionExpiredError),
+            server(HttpError::AccessExpiredError),
+            server(HttpError::AccessDeactivatedError),
+            server(HttpError::AccessBlockedError),
+            LoginError::InvalidAccessToken {
+                error_message: "bad token".into(),
+            },
+            LoginError::InvalidPassphrase {
+                error_message: "changed".into(),
+            },
+            LoginError::InvalidKey {
+                error_message: "changed".into(),
+            },
+        ] {
+            assert_eq!(
+                classify_resume_failure(&e),
+                ResumeFailure::SessionInvalid,
+                "{e}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_refused_client_version_keeps_the_session() {
+        // The 474 that took every user's saved session with it: Tuta never
+        // looked at the token, so the token is not what is wrong.
+        assert_eq!(
+            classify_resume_failure(&server(HttpError::InvalidSoftwareVersionError)),
+            ResumeFailure::ClientRejected
+        );
+    }
+
+    #[test]
+    fn an_outage_or_an_unexpected_error_keeps_the_session() {
+        for e in [
+            server(HttpError::ServiceUnavailableError {
+                suspension_time_sec: None,
+            }),
+            server(HttpError::InternalServerError),
+            server(HttpError::BadGatewayError),
+            server(HttpError::NotAuthorizedError),
+            LoginError::ApiCall {
+                source: ApiCallError::RestClient {
+                    source: RestClientError::NetworkError,
+                },
+            },
+            LoginError::ApiCall {
+                source: ApiCallError::InternalSdkError {
+                    error_message: "InvalidDataSizeError".into(),
+                },
+            },
+        ] {
+            assert_eq!(classify_resume_failure(&e), ResumeFailure::Transient, "{e}");
+        }
+    }
+}
+
+#[cfg(test)]
+mod forget_session_tests {
+    use super::{delete_credentials, has_saved_session, CREDENTIALS_CACHE};
+
+    fn fake_credentials(email: &str) -> tutasdk::login::Credentials {
+        tutasdk::login::Credentials {
+            login: email.to_string(),
+            user_id: tutasdk::GeneratedId("fakeuser0".to_string()),
+            access_token: "fake-token".to_string(),
+            encrypted_passphrase_key: vec![0; 32],
+            credential_type: tutasdk::login::CredentialType::Internal,
+        }
+    }
+
+    #[test]
+    fn a_forgotten_session_stays_forgotten_whatever_the_keyring_says() {
+        // The CLI decides whether a password prompt makes sense from
+        // `has_saved_session`. After the server judged the token dead, that
+        // must answer "no" from the in-process cache alone: if the keyring
+        // refused the deletion, re-reading it would resurrect the rejected
+        // token and the CLI would exit instead of asking for a password.
+        // The mock store keeps this off the real keyring; its entries start
+        // empty, so the deletion below reports NoEntry.
+        keyring::set_default_credential_builder(keyring::mock::default_credential_builder());
+        crate::net::log_capture::install();
+        let email = "nobody@example.invalid";
+        *CREDENTIALS_CACHE.lock().unwrap() = Some(Some(fake_credentials(email)));
+        assert!(
+            has_saved_session(email),
+            "precondition: the session is loaded"
+        );
+
+        delete_credentials(email);
+
+        assert!(
+            matches!(*CREDENTIALS_CACHE.lock().unwrap(), Some(None)),
+            "the cache must say 'nothing there', not 'not loaded yet'"
+        );
+        assert!(!has_saved_session(email));
+        assert!(
+            crate::net::log_capture::lines_containing("Could not remove the stale session")
+                .is_empty(),
+            "a missing entry is not worth a warning"
+        );
     }
 }
 
