@@ -5,7 +5,7 @@ current when the pin moves — it is the only place the series is described
 as a whole.
 
 - **Base:** tutao `v359.260904.0` (`aea5846b93a1412451e885bf99002401c3b087e8`)
-- **Branch:** `tutabridge-integration-359` on the SDK fork
+- **Branch:** `tutabridge-integration` on the SDK fork (`spartanz51/tutanota`)
 - **Pin:** `7a3d4f9fe333d78b3002a3a3cab223a2ea9167ff`
 
 The base is a real tutao release tag, not a relabelled older tree. `git
